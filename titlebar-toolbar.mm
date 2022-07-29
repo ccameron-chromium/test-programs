@@ -19,6 +19,8 @@ MyTitlebarViewController* titlebar_omni_view_controller = nil;
 NSView* titlebar_tab_view = nil;
 NSView* titlebar_omni_view = nil;
 
+NSToolbar* toolbar = nil;
+
 @implementation MainWindow
 - (void)keyDown:(NSEvent *)event {
   if ([event isARepeat])
@@ -105,14 +107,17 @@ int main(int argc, char* argv[]) {
   }
 
   [titlebar_omni_view_controller setView:titlebar_omni_view];
-  [titlebar_omni_view_controller setLayoutAttribute:NSLayoutAttributeBottom];
+  // [titlebar_omni_view_controller setLayoutAttribute:NSLayoutAttributeBottom];
+  [titlebar_omni_view_controller setAutomaticallyAdjustsSize:NO];
+
+  toolbar = [[NSToolbar alloc] init];
 
   // [window setTitleVisibility:NSWindowTitleHidden];
-  // [window setTitlebarAppearsTransparent:YES];
+  [window setTitlebarAppearsTransparent:YES];
   [window addTitlebarAccessoryViewController:titlebar_tab_view_controller];
   [window addTitlebarAccessoryViewController:titlebar_omni_view_controller];
-  // [window setToolbarStyle:NSWindowToolbarStyleUnified];
-
+  [window setToolbar:toolbar];
+  [window setToolbarStyle:NSWindowToolbarStyleUnifiedCompact];
 
   [window makeKeyAndOrderFront:nil];
 
