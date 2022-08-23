@@ -27,6 +27,23 @@ AVSampleBufferDisplayLayer* sample_display_layer = nil;
 typedef std::map<CFAbsoluteTime, CVImageBufferRef> TimeToFrameMap;
 TimeToFrameMap decoded_images;
 std::deque<CVImageBufferRef> displayed_images;
+uint8_t avif_irot_angle = 0;
+uint8_t avif_imir_mode = 0;
+
+void CGAffineTransformToAVIF(CGAffineTransform t, uint8_t* irot_angle, uint8_t* imir_mode) {
+  *imir_mode = 0;
+  if (t.a == 1 && t.b == 0 && t.c == 0 && t.d == 1) {
+    *irot_angle = 0;
+  } else if (t.a == 0 && t.b == 1 && t.c == -1 && t.d == 0) {
+    *irot_angle = 1;
+  } else if (t.a == -1 && t.b == 0 && t.c == 0 && t.d == -1) {
+    *irot_angle = 2;
+  } else if (t.a == 0 && t.b == -1 && t.c == 1 && t.d == -1) {
+    *irot_angle = 3;
+  } else {
+    printf("Failed to convert CGAFffineTransform\n");
+  }
+}
 
 void DumpPixelBuffer(CVPixelBufferRef pixel_buffer) {
   CVPixelBufferLockBaseAddress(pixel_buffer, kCVPixelBufferLock_ReadOnly);
@@ -45,7 +62,7 @@ void DumpPixelBuffer(CVPixelBufferRef pixel_buffer) {
     image->transferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_HLG;
     image->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_BT2020_NCL;
     image->transformFlags = AVIF_TRANSFORM_IROT;
-    image->irot.angle = 3;
+    image->irot.angle = avif_irot_angle;
     image->yuvRange = AVIF_RANGE_LIMITED;
     avifImageAllocatePlanes(image, AVIF_PLANES_YUV);
     {
@@ -145,12 +162,22 @@ void ReadFileFromDisk(const char* filename) {
   [asset_reader addOutput:asset_reader_output];
   [asset_reader startReading];
 
+
+  printf("getting orientation\n");
+  fflush(stdout);
+  CGAffineTransformToAVIF([video_track preferredTransform],
+                          &avif_irot_angle,
+                          &avif_imir_mode);
+  printf("angle:%d, mode:%d\n", avif_irot_angle, avif_imir_mode);
+
   printf("Reading the entire stream from disk...\n");
   while (1) {
     CMSampleBufferRef cm_sample_buffer =
         [asset_reader_output copyNextSampleBuffer];
     if (!cm_sample_buffer)
       break;
+
+    // CFShow(cm_sample_buffer);
     cm_sample_buffers_from_asset_reader.push_back(cm_sample_buffer);
   }
   printf("Done.\n");
