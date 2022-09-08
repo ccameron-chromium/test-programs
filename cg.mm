@@ -1,5 +1,5 @@
 // clang++ cg.mm -framework Cocoa -framework QuartzCore && ./a.out
-// Press spacebar to advance the frame.
+// Press q to quit.
 #include <Cocoa/Cocoa.h>
 #include <QuartzCore/CALayer.h>
 #include <QuartzCore/QuartzCore.h>
@@ -45,19 +45,6 @@ CGRect draw_rect;
 }
 @end
 
-void DrawRandomRect() {
-  // This CATransaction disables the implicit fade animation.
-  [CATransaction begin];
-  [CATransaction setValue:[NSNumber numberWithBool:YES]
-                   forKey:kCATransactionDisableActions];
-
-  // We can specify a damage rect, or several (with several calls), or just
-  // indicate that everything was damaged.
-  // [my_layer setNeedsDisplayInRect:draw_rect];
-
-  [CATransaction commit];
-}
-
 @implementation MainWindow
 - (void)keyDown:(NSEvent *)event {
   if ([event isARepeat])
@@ -70,9 +57,6 @@ void DrawRandomRect() {
   switch ([characters characterAtIndex:0]) {
     case 'q':
       [NSApp terminate:nil];
-      break;
-    case ' ':
-      DrawRandomRect();
       break;
     default:
       break;
@@ -100,17 +84,8 @@ int main(int argc, char* argv[]) {
 
   my_layer = [[MyLayer alloc] init];
 
-  // I think that this might force you into software if you enable it.
-  // [my_layer setShouldRasterize:YES];
-
+  [my_layer setShouldRasterize:YES];
   [my_layer setDrawsAsynchronously:NO];
-
-  // You can ask the CALayer tree to draw itself by using the function
-  // -[CALayer renderInContext:] but that ... requires that you have a
-  // CGContext, which, if you create it, won't be accelerated :(
-  // Alternatively, you can draw to a window and then crapture that using
-  // ScreenCaptureKit ... that might get you an accelerated render that
-  // ends up in an accelerated bitmap.
 
   CGFloat components[4] = {0, 2, 0, 1};
   CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceExtendedSRGB);
@@ -118,10 +93,8 @@ int main(int argc, char* argv[]) {
 
   [layer addSublayer:my_layer];
   [my_layer setFrame:CGRectMake(0, 0, width, height)];
-  // [my_layer setContentsFormat:kCAContentsFormatRGBA16Float];
   [my_layer setBackgroundColor:color];
   [my_layer setNeedsDisplay];
-  DrawRandomRect();
   
   [window setTitle:@"Test"];
   [window makeKeyAndOrderFront:nil];
