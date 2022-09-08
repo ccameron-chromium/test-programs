@@ -99,7 +99,8 @@ int main(int argc, char* argv[]) {
   printf("The content is a gradient in kCGColorSpaceExtendedSRGB with red going from 0 to 2\n");
   printf("When drawn to a CGBitmapContext, the color saturates and stops changing when red>1\n");
   printf("In the CALayer, the gradient becomes a pale orange when red>1\n");
-  printf("The background of the CALayer is color(srgb 0 2 0)\n");
+  printf("* UNLESS, I force my monitor's profile to sRGB in Settings, then it saturates!\n");
+  printf("* (but not Display P3)\n");
 
   printf("\n");
   printf("Rendering to a bitmap context and reading it back. The graident is:\n");
