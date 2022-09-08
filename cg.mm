@@ -1,5 +1,6 @@
 // clang++ cg.mm -framework Cocoa -framework QuartzCore && ./a.out
 // Press q to quit.
+// See the printf-ed comments below.
 #include <Cocoa/Cocoa.h>
 #include <QuartzCore/CALayer.h>
 #include <QuartzCore/QuartzCore.h>
@@ -15,33 +16,28 @@
 
 MainWindow* window = nil;
 MyLayer* my_layer = nil;
-int width = 640;
-int height = 480;
-float shade = 1.0;
+int width = 32*16;
+int height = 64;
 CGRect draw_rect;
 
 @implementation MyLayer
 - (void)drawInContext:(CGContextRef)ctx {
-  CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceExtendedSRGB);
   for (size_t i = 0; i < 17; ++i) {
-    CGFloat components[4] = {1 + i/16.f, 0, 0, 1};
+    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceExtendedSRGB);
+    CGFloat components[4] = {i/8.f, 0, 0, 1};
     CGColorRef color = CGColorCreate(space, components);
     CGContextSetFillColorWithColor(ctx, color);
     CFRelease(color);
-    CGContextFillRect(ctx, CGRectMake(i*32, 0, 32, 32));
+    CGContextFillRect(ctx, CGRectMake(i*32, 32, 32, 32));
   }
-
-  // Dump what they care to tell us about the context (it will give us the
-  // context type, which will be kCGContextTypeBitmap or kCGContextTypeUnknown.
-  CFShow(ctx);
-
-  // Dump the CALayer's contents (at first there won't be any, but then the next
-  // time around it'll be CABackingStore).
-  CFShow([self contents]);
-
-  shade -= 0.05;
-  if (shade <= 0.6)
-    shade = 1.0;
+  {
+    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3);
+    CGFloat components[4] = {1, 0, 0, 1};
+    CGColorRef color = CGColorCreate(space, components);
+    CGContextSetFillColorWithColor(ctx, color);
+    CFRelease(color);
+    CGContextFillRect(ctx, CGRectMake(0, 0, 32, 32));
+  }
 }
 @end
 
@@ -99,8 +95,29 @@ int main(int argc, char* argv[]) {
   [window setTitle:@"Test"];
   [window makeKeyAndOrderFront:nil];
 
-  printf("This draws rectangles with color(srgb 1 0 0) to color(srgb 2 0 0) in increments of 1/16\n");
-  printf("The background is color(srgb 0 2 0)\n");
+  printf("This program draws the same content to a CALayer and to an sRGB bitmap\n");
+  printf("The content is a gradient in kCGColorSpaceExtendedSRGB with red going from 0 to 2\n");
+  printf("When drawn to a CGBitmapContext, the color saturates and stops changing when red>1\n");
+  printf("In the CALayer, the gradient becomes a pale orange when red>1\n");
+  printf("The background of the CALayer is color(srgb 0 2 0)\n");
+
+  printf("\n");
+  printf("Rendering to a bitmap context and reading it back. The graident is:\n");
+  {
+    uint32_t* pixels = new uint32_t[width*height];
+    memset(pixels, 0, 4*width*height);
+
+    CGContextRef ctx = CGBitmapContextCreate(
+        pixels, width, height, 8, 4*width, CGColorSpaceCreateWithName(kCGColorSpaceSRGB), kCGImageAlphaPremultipliedLast|kCGImageByteOrder32Little);
+    CFShow(ctx);
+    [my_layer drawInContext:ctx];
+    CFRelease(ctx);
+    printf("The gradient is:\n");
+    for (int x = 0; x < width; x += 16) {
+      printf("    At %d,%d, the color is %x\n", x, 0, pixels[x]);
+    }
+    printf("The color(display-p3 1 0 0) is: %x\n", pixels[32*width]);
+  }
 
   [NSApp activateIgnoringOtherApps:YES];
   [NSApp run];
