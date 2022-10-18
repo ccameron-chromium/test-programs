@@ -35,11 +35,11 @@ void CGAffineTransformToAVIF(CGAffineTransform t, uint8_t* irot_angle, uint8_t* 
   if (t.a == 1 && t.b == 0 && t.c == 0 && t.d == 1) {
     *irot_angle = 0;
   } else if (t.a == 0 && t.b == 1 && t.c == -1 && t.d == 0) {
-    *irot_angle = 1;
+    *irot_angle = 3;
   } else if (t.a == -1 && t.b == 0 && t.c == 0 && t.d == -1) {
     *irot_angle = 2;
   } else if (t.a == 0 && t.b == -1 && t.c == 1 && t.d == -1) {
-    *irot_angle = 3;
+    *irot_angle = 1;
   } else {
     printf("Failed to convert CGAFffineTransform\n");
   }
