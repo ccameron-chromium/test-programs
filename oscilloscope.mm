@@ -5,16 +5,12 @@
 #include <list>
 #include <pthread.h>
 
-const int width = 512;
+const int width = 1280;
 const int height = 512;
 
 const size_t kSampleCount = 5000;
 
 float viz_current_max = 4000.f;
-
-float CurrentToY(float current) {
-  return 2* current / viz_current_max - 1;
-}
 
 std::vector<float> sample_times;
 std::vector<float> sample_currents;
@@ -36,9 +32,26 @@ struct Sample {
 float sample_timebase = 0;
 float sample_period = 1000/60;
 float sample_max_time = 0;
+float viz_max_time = 0;
 bool on_sample_on_main_sample_pending = false;
+size_t viz_periods = 5;
 std::list<Sample> samples_on_input_thread;
 std::list<Sample> samples_on_main_thread;
+
+float TimeToX(float t) {
+  float x = (viz_max_time - t) / sample_period;
+  return 1 - x/2;
+}
+
+float CurrentToY(float current) {
+  return 2 * current / viz_current_max - 1;
+}
+
+void UpdateVizMaxTime() {
+  viz_max_time = sample_period * (int)((sample_max_time + sample_period) / sample_period);
+}
+
+void Draw();
 
 float Score(const std::vector<float>& x, size_t T, size_t len) {
   float x_avg = 0;
@@ -99,10 +112,12 @@ void FindBestModes() {
       max_corr_i / 10.f,
       1.f / sec,
       max_corr);
+
+  sample_period = msec;
+  UpdateVizMaxTime();
+
+  Draw();
 }
-
-
-void Draw();
 
 ///////
 
@@ -112,6 +127,7 @@ void OnSampleOnMainThread() {
   sample_max_time = samples_on_main_thread.front().time;
   on_sample_on_main_sample_pending = false;
   pthread_mutex_unlock(&read_samples_mutex);
+  UpdateVizMaxTime();
   Draw();
 }
 
@@ -251,11 +267,13 @@ void Draw() {
 
     std::vector<float> positions;
     for (const auto& sample : samples_on_main_thread) {
-      float x = (sample_max_time - sample.time) / sample_period;
-      if (x > 1)
+      float x = TimeToX(sample.time);
+      if (x < -1)
         break;
-      positions.push_back(2*x - 1);
+      positions.push_back(x);
       positions.push_back(CurrentToY(sample.current));
+      if (positions.size() > 2048)
+        break;
     }
     [encoder setVertexBytes:positions.data()
                      length:positions.size() * sizeof(float)
@@ -277,9 +295,33 @@ void Draw() {
     [encoder setRenderPipelineState:renderPipelineState];
 
     std::vector<float> positions;
-    for (float i = 0.f; i <= viz_current_max; i += 1.f) {
-      positions.push_back(-1); positions.push_back(CurrentToY(i*1000));
-      positions.push_back( 1); positions.push_back(CurrentToY(i*1000));
+    for (float i = 0.f; i <= viz_current_max; i += 1000.f) {
+      positions.push_back(-1); positions.push_back(CurrentToY(i));
+      positions.push_back( 1); positions.push_back(CurrentToY(i));
+    }
+    [encoder setVertexBytes:positions.data()
+                     length:positions.size() * sizeof(float)
+                    atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeLine
+                vertexStart:0
+                vertexCount:positions.size() / 2];
+  }
+
+  {
+    MTLViewport viewport;
+    viewport.originX = 0;
+    viewport.originY = 0;
+    viewport.width = width;
+    viewport.height = height;
+    viewport.znear = -1.0;
+    viewport.zfar = 1.0;
+    [encoder setViewport:viewport];
+    [encoder setRenderPipelineState:renderPipelineState];
+
+    std::vector<float> positions;
+    for (size_t i = 0; i < viz_periods; ++i) {
+      positions.push_back(TimeToX(viz_max_time - i*sample_period)); positions.push_back(-1);
+      positions.push_back(TimeToX(viz_max_time - i*sample_period)); positions.push_back( 1);
     }
     [encoder setVertexBytes:positions.data()
                      length:positions.size() * sizeof(float)
