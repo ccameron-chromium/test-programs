@@ -10,6 +10,12 @@ const int height = 512;
 
 const size_t kSampleCount = 5000;
 
+float viz_current_max = 4000.f;
+
+float CurrentToY(float current) {
+  return 2* current / viz_current_max - 1;
+}
+
 std::vector<float> sample_times;
 std::vector<float> sample_currents;
 
@@ -34,6 +40,68 @@ bool on_sample_on_main_sample_pending = false;
 std::list<Sample> samples_on_input_thread;
 std::list<Sample> samples_on_main_thread;
 
+float Score(const std::vector<float>& x, size_t T, size_t len) {
+  float x_avg = 0;
+  float y_avg = 0;
+  for (size_t i = 0; i < len; ++i) {
+    float xi = x[i];
+    float yi = x[i+T];
+    x_avg += xi;
+    y_avg += yi;
+  }
+  x_avg /= len;
+  y_avg /= len;
+
+  float x_bar_norm = 0;
+  float y_bar_norm = 0;
+  for (size_t i = 0; i < len; ++i) {
+    float xi = x[i] - x_avg;
+    float yi = x[i+T] - y_avg;
+    x_bar_norm += xi*xi;
+    y_bar_norm += yi*yi;
+  }
+  x_bar_norm = sqrtf(x_bar_norm);
+  y_bar_norm = sqrtf(y_bar_norm);
+
+  float corr = 0;
+  for (size_t i = 0; i < len; ++i) {
+    float xi = (x[i] - x_avg) / x_bar_norm;
+    float yi = (x[i+T] - y_avg) / y_bar_norm;
+    corr += xi * yi;
+  }
+  return corr;
+}
+
+void FindBestModes() {
+  printf("FindBestModes\n");
+  int min_period_samples = 50;
+  int max_period_samples = 500;
+  std::vector<float> correlations;
+  correlations.resize(max_period_samples);
+
+  std::vector<float> currents;
+  for (const auto& sample : samples_on_main_thread) {
+    currents.push_back(sample.current);
+  }
+
+  float max_corr = 0;
+  int max_corr_i = 0;
+  for (int i = 10; i < 500; ++i) {
+    float corr = Score(currents, i, 5*i);
+    if (corr > max_corr) {
+      max_corr = corr;
+      max_corr_i = i;
+    }
+  }
+  float msec = max_corr_i / 10.f;
+  float sec = msec / 1000;
+  printf("max correlation at %f msec (%f Hz), correlation %f\n",
+      max_corr_i / 10.f,
+      1.f / sec,
+      max_corr);
+}
+
+
 void Draw();
 
 ///////
@@ -41,10 +109,9 @@ void Draw();
 void OnSampleOnMainThread() {
   pthread_mutex_lock(&read_samples_mutex);
   samples_on_main_thread = samples_on_input_thread;
-  sample_max_time = samples_on_main_thread.back().time;
+  sample_max_time = samples_on_main_thread.front().time;
   on_sample_on_main_sample_pending = false;
   pthread_mutex_unlock(&read_samples_mutex);
-  printf("OnSampleOnMainThread %f!\n", sample_max_time);
   Draw();
 }
 
@@ -56,7 +123,7 @@ void OnSampleOnInputThread(float time, float current, float voltage) {
 
   pthread_mutex_lock(&read_samples_mutex);
   samples_on_input_thread.push_front(sample);
-  if (samples_on_input_thread.size() > 1000)
+  if (samples_on_input_thread.size() > 10000)
     samples_on_input_thread.pop_back();
 
   if (!on_sample_on_main_sample_pending) {
@@ -110,8 +177,7 @@ void CreateRenderPipelineState() {
       "\n"
       "vertex RasterizerData vertexShader(\n"
       "    uint vertexID [[vertex_id]],\n"
-      "    constant vector_float2 *positions[[buffer(0)]],\n"
-      "    constant vector_float4 *colors[[buffer(1)]]) {\n"
+      "    constant vector_float2 *positions[[buffer(0)]]) {\n"
       "  RasterizerData out;\n"
       "  out.clipSpacePosition = vector_float4(0.0, 0.0, 0.0, 1.0);\n"
       "  out.clipSpacePosition.xy = positions[vertexID].xy;\n"
@@ -151,8 +217,6 @@ void CreateRenderPipelineState() {
   }
 }
 
-
-
 void Draw() {
   if (!device) {
     device = MTLCreateSystemDefaultDevice();
@@ -190,9 +254,8 @@ void Draw() {
       float x = (sample_max_time - sample.time) / sample_period;
       if (x > 1)
         break;
-      float y = (sample.current / 1000.f);
-      positions.push_back(x);
-      positions.push_back(y);
+      positions.push_back(2*x - 1);
+      positions.push_back(CurrentToY(sample.current));
     }
     [encoder setVertexBytes:positions.data()
                      length:positions.size() * sizeof(float)
@@ -201,6 +264,31 @@ void Draw() {
                 vertexStart:0
                 vertexCount:positions.size() / 2];
   }
+
+  {
+    MTLViewport viewport;
+    viewport.originX = 0;
+    viewport.originY = 0;
+    viewport.width = width;
+    viewport.height = height;
+    viewport.znear = -1.0;
+    viewport.zfar = 1.0;
+    [encoder setViewport:viewport];
+    [encoder setRenderPipelineState:renderPipelineState];
+
+    std::vector<float> positions;
+    for (float i = 0.f; i <= viz_current_max; i += 1.f) {
+      positions.push_back(-1); positions.push_back(CurrentToY(i*1000));
+      positions.push_back( 1); positions.push_back(CurrentToY(i*1000));
+    }
+    [encoder setVertexBytes:positions.data()
+                     length:positions.size() * sizeof(float)
+                    atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeLine
+                vertexStart:0
+                vertexCount:positions.size() / 2];
+  }
+
   [encoder endEncoding];
 
   [commandBuffer presentDrawable:drawable];
@@ -216,18 +304,30 @@ void Draw() {
     return;
 
   NSString *characters = [event charactersIgnoringModifiers];
-  if ([characters length] != 1)
+  if ([characters length] != 1) {
     return;
+  }
 
   switch ([characters characterAtIndex:0]) {
     case ' ':
+      FindBestModes();
       break;
     case 'q':
       [NSApp terminate:nil];
       break;
+    case 0xf700:
+      viz_current_max += 500;
+      break;
+    case 0xf701:
+      if (viz_current_max > 500)
+        viz_current_max -= 500;
+      break;
     default:
+      printf("Unsupported input 0x%x\n", [characters characterAtIndex:0]);
       break;
   }
+
+  Draw();
 }
 @end
 
