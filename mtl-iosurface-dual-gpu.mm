@@ -339,7 +339,7 @@ id<MTLTexture> WrapIOSurface(id<MTLDevice> device, IOSurfaceRef iosurface, uint6
   [tex_desc setMipmapLevelCount:1];
   [tex_desc setArrayLength:1];
   [tex_desc setSampleCount:1];
-  [tex_desc setStorageMode:MTLStorageModePrivate];
+  [tex_desc setStorageMode:MTLStorageModeManaged];
   // This doesn't make a difference.
   // [tex_desc setHazardTrackingMode:MTLResourceHazardTrackingModeTracked];
   id<MTLTexture> texture = [device newTextureWithDescriptor:tex_desc
