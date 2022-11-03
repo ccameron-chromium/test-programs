@@ -31,9 +31,9 @@ bool g_use_dual_gpu = true;
 
 // Whether or not to set framebufferOnly on the CAMetalLayers. This seems
 // not to make a behavioral difference.
-bool g_set_framebuffer_only = true;
+bool g_set_framebuffer_only = false;
 
-// Use a MTLEvent to synchronize between the two MTLCommandBuffers. This is
+// Use a MTLSharedEvent to synchronize between the two MTLCommandBuffers. This is
 // sufficient for correct behavior in the single-GPU case.
 bool g_use_event = true;
 
@@ -41,7 +41,10 @@ bool g_use_event = true;
 // command buffer to read from the source. This is necessary to get correct
 // results when using dual GPU sharing using IOSurfaces (presumably because
 // it allows the commands to page the IOSurface across).
-bool g_wait_until_scheduled = true;
+bool g_wait_until_scheduled = false;
+
+// If this is true, then re-bind the IOSurface to a texture every frame.
+bool g_rebind_iosurface_to_texture_every_frame = false;
 
 // The number of iterations to use in the Mandlebrot rendering. Increase
 // or decrease this to simulate more or less GPU work.
@@ -391,27 +394,6 @@ void Draw() {
       });
     }];
 
-    // Populate src_texture to be shared with dst_device.
-    switch (share_mode) {
-      case kShareViaIOSurface: {
-        // Bind src_layer's drawable's IOSurface to a texture in dst_device
-        IOSurfaceRef iosurface = [[drawable texture] iosurface];
-        IOSurfaceID ioid = IOSurfaceGetID(iosurface);
-        src_texture = iosurface_textures[ioid];
-        if (!src_texture) {
-          printf("Binding IOSurface to texture\n");
-          src_texture = WrapIOSurface(dst_device, [[drawable texture] iosurface]);
-          iosurface_textures[ioid] = src_texture;
-        }
-        CHECK(src_texture);
-        break;
-      }
-      case kShareDirect:
-        CHECK(src_device == dst_device);
-        src_texture = [drawable texture];
-        break;
-    }
-
     // Draw the Mandlebrot set to src_layer's drawable, and print the execution time.
     id<MTLCommandBuffer> commandBuffer = [src_commandQueue commandBuffer];
     [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
@@ -421,10 +403,13 @@ void Draw() {
       }
     }];
 
+    if (g_use_event) {
+      [commandBuffer encodeWaitForEvent:event value:event_value];
+    }
+
     DrawMandlebrot(commandBuffer, [drawable texture]);
 
     if (g_use_event) {
-      [commandBuffer encodeWaitForEvent:event value:event_value];
       event_value += 1;
       [commandBuffer encodeSignalEvent:event value:event_value];
     }
@@ -435,6 +420,28 @@ void Draw() {
 
     if (g_wait_until_scheduled) {
       [commandBuffer waitUntilScheduled];
+    }
+
+    // Populate src_texture to be shared with dst_device.
+    switch (share_mode) {
+      case kShareViaIOSurface: {
+        // Bind src_layer's drawable's IOSurface to a texture in dst_device
+        IOSurfaceRef iosurface = [[drawable texture] iosurface];
+        IOSurfaceID ioid = IOSurfaceGetID(iosurface);
+        src_texture = iosurface_textures[ioid];
+        if (!src_texture) {
+          src_texture = WrapIOSurface(dst_device, [[drawable texture] iosurface]);
+          if (!g_rebind_iosurface_to_texture_every_frame) {
+            iosurface_textures[ioid] = src_texture;
+          }
+        }
+        CHECK(src_texture);
+        break;
+      }
+      case kShareDirect:
+        CHECK(src_device == dst_device);
+        src_texture = [drawable texture];
+        break;
     }
   }
 
@@ -451,11 +458,14 @@ void Draw() {
     
     if (g_use_event) {
       [commandBuffer encodeWaitForEvent:event value:event_value];
-      event_value += 1;
-      [commandBuffer encodeSignalEvent:event value:event_value];
     }
 
     DrawBlit(commandBuffer, src_texture, [drawable texture]);
+
+    if (g_use_event) {
+      event_value += 1;
+      [commandBuffer encodeSignalEvent:event value:event_value];
+    }
 
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
@@ -488,14 +498,18 @@ void InitializeMetal() {
       printf("Sharing textures by sharing MTLTexture directly\n");
   }
   if (g_use_event)
-    printf("Using MTLEvent\n");
+    printf("Using MTLSharedEvent\n");
   else
-    printf("Not using MTLEvent\n");
+    printf("Not using MTLSharedEvent\n");
   if (g_wait_until_scheduled)
     printf("Using waitUntilScheduled\n");
   else
     printf("Not using waitUntilScheduled\n");
   if (g_set_framebuffer_only)
+    printf("Rebinding IOSurface to MTLTexture every frame\n");
+  else
+    printf("Not rebinding IOSurface to MTLTexture every frame\n");
+  if (g_rebind_iosurface_to_texture_every_frame)
     printf("Using setFrameBufferOnly:YES\n");
   else
     printf("Using setFrameBufferOnly:NO\n");
