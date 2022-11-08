@@ -10,10 +10,10 @@ const int height = 512;
 
 const size_t kSampleCount = 5000;
 
-float viz_current_max = 4000.f;
+float viz_power_max = 2.f;
 
 std::vector<float> sample_times;
-std::vector<float> sample_currents;
+std::vector<float> sample_powers;
 
 id<MTLDevice> device = nil;
 id<MTLCommandQueue> commandQueue = nil;
@@ -27,10 +27,13 @@ struct Sample {
   float time;
   float current;
   float voltage;
+  float PowerInWatts() const {
+    return (current / 1000.f) * (voltage / 1000.f);
+  }
 };
 
 float sample_timebase = 0;
-float sample_period = 1000/60;
+float sample_period = 1000 * 1.f/60.f;
 float sample_max_time = 0;
 float viz_max_time = 0;
 bool on_sample_on_main_sample_pending = false;
@@ -43,8 +46,8 @@ float TimeToX(float t) {
   return 1 - x/2;
 }
 
-float CurrentToY(float current) {
-  return 2 * current / viz_current_max - 1;
+float PowerToY(float power) {
+  return 2 * power / viz_power_max - 1;
 }
 
 void UpdateVizMaxTime() {
@@ -92,15 +95,15 @@ void FindBestModes() {
   std::vector<float> correlations;
   correlations.resize(max_period_samples);
 
-  std::vector<float> currents;
+  std::vector<float> powers;
   for (const auto& sample : samples_on_main_thread) {
-    currents.push_back(sample.current);
+    powers.push_back(sample.PowerInWatts());
   }
 
   float max_corr = 0;
   int max_corr_i = 0;
   for (int i = 10; i < 500; ++i) {
-    float corr = Score(currents, i, 5*i);
+    float corr = Score(powers, i, 5*i);
     if (corr > max_corr) {
       max_corr = corr;
       max_corr_i = i;
@@ -200,8 +203,9 @@ void CreateRenderPipelineState() {
       "  return out;\n"
       "}\n"
       "\n"
-      "fragment float4 fragmentShader(RasterizerData in [[stage_in]]) {\n"
-      "    return float4(1.0, 1.0, 1.0, 1.0);\n"
+      "fragment float4 fragmentShader(RasterizerData in [[stage_in]],\n"
+      "                               constant float4 &color [[buffer(0)]]) {\n"
+      "    return color;\n"
       "}\n"
       "";
 
@@ -254,10 +258,86 @@ void Draw() {
     encoder = [commandBuffer renderCommandEncoderWithDescriptor:desc];
   }
 
-  {
+  for (int i = 0; i <= viz_power_max; i += 1) {
     MTLViewport viewport;
     viewport.originX = 0;
     viewport.originY = 0;
+    viewport.width = width;
+    viewport.height = height;
+    viewport.znear = -1.0;
+    viewport.zfar = 1.0;
+    [encoder setViewport:viewport];
+    [encoder setRenderPipelineState:renderPipelineState];
+
+    std::vector<float> positions;
+    positions.push_back(-1); positions.push_back(PowerToY(i));
+    positions.push_back( 1); positions.push_back(PowerToY(i));
+    [encoder setVertexBytes:positions.data()
+                     length:positions.size() * sizeof(float)
+                    atIndex:0];
+    float c = 0;
+    switch (i % 4) {
+      case 0: c = 1.f/1.f; break;
+      case 1: c = 1.f/16.f; break;
+      case 2: c = 1.4/4.f; break;
+      case 3: c = 1.f/16.f; break;
+      default: break;
+    }
+    float color[4] = {c, c, c, 1.f};
+    [encoder setFragmentBytes:color
+                       length:sizeof(color)
+                      atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeLine
+                vertexStart:0
+                vertexCount:positions.size() / 2];
+  }
+
+  for (size_t i = 0; i < viz_periods; ++i) {
+    MTLViewport viewport;
+    viewport.originX = 0;
+    viewport.originY = 0;
+    viewport.width = width;
+    viewport.height = height;
+    viewport.znear = -1.0;
+    viewport.zfar = 1.0;
+    [encoder setViewport:viewport];
+    [encoder setRenderPipelineState:renderPipelineState];
+
+    std::vector<float> positions;
+    positions.push_back(TimeToX(viz_max_time - i*sample_period)); positions.push_back(-1);
+    positions.push_back(TimeToX(viz_max_time - i*sample_period)); positions.push_back( 1);
+    [encoder setVertexBytes:positions.data()
+                     length:positions.size() * sizeof(float)
+                    atIndex:0];
+    float color[4] = {0.5, 0.5, 0.5, 1.0};
+    [encoder setFragmentBytes:color
+                       length:sizeof(color)
+                      atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeLine
+                vertexStart:0
+                vertexCount:positions.size() / 2];
+  }
+
+  
+  for (size_t i = 0; i < 9; ++i) {
+    int dx = 0;
+    int dy = 0;
+    switch (i) {
+      case 0: dx = -1; dy = -1; break;
+      case 1: dx = -1; dy =  1; break;
+      case 2: dx =  1; dy = -1; break;
+      case 3: dx =  1; dy =  1; break;
+      case 4: dx =  0; dy = -1; break;
+      case 5: dx =  0; dy =  1; break;
+      case 6: dx = -1; dy =  0; break;
+      case 7: dx =  1; dy =  0; break;
+      default: break;
+    }
+    
+  
+    MTLViewport viewport;
+    viewport.originX = dx;
+    viewport.originY = dy;
     viewport.width = width;
     viewport.height = height;
     viewport.znear = -1.0;
@@ -271,65 +351,24 @@ void Draw() {
       if (x < -1)
         break;
       positions.push_back(x);
-      positions.push_back(CurrentToY(sample.current));
+      positions.push_back(PowerToY(sample.PowerInWatts()));
       if (positions.size() > 2048)
         break;
     }
     [encoder setVertexBytes:positions.data()
                      length:positions.size() * sizeof(float)
                     atIndex:0];
+    float cx = (dx == 0) ? 1.0 : 0.5;
+    float cy = (dy == 0) ? 1.0 : 0.5;
+    float color[4] = {0.0, cx*cy, 0.0, 1.0};
+    [encoder setFragmentBytes:color
+                       length:sizeof(color)
+                      atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeLineStrip
                 vertexStart:0
                 vertexCount:positions.size() / 2];
   }
 
-  {
-    MTLViewport viewport;
-    viewport.originX = 0;
-    viewport.originY = 0;
-    viewport.width = width;
-    viewport.height = height;
-    viewport.znear = -1.0;
-    viewport.zfar = 1.0;
-    [encoder setViewport:viewport];
-    [encoder setRenderPipelineState:renderPipelineState];
-
-    std::vector<float> positions;
-    for (float i = 0.f; i <= viz_current_max; i += 1000.f) {
-      positions.push_back(-1); positions.push_back(CurrentToY(i));
-      positions.push_back( 1); positions.push_back(CurrentToY(i));
-    }
-    [encoder setVertexBytes:positions.data()
-                     length:positions.size() * sizeof(float)
-                    atIndex:0];
-    [encoder drawPrimitives:MTLPrimitiveTypeLine
-                vertexStart:0
-                vertexCount:positions.size() / 2];
-  }
-
-  {
-    MTLViewport viewport;
-    viewport.originX = 0;
-    viewport.originY = 0;
-    viewport.width = width;
-    viewport.height = height;
-    viewport.znear = -1.0;
-    viewport.zfar = 1.0;
-    [encoder setViewport:viewport];
-    [encoder setRenderPipelineState:renderPipelineState];
-
-    std::vector<float> positions;
-    for (size_t i = 0; i < viz_periods; ++i) {
-      positions.push_back(TimeToX(viz_max_time - i*sample_period)); positions.push_back(-1);
-      positions.push_back(TimeToX(viz_max_time - i*sample_period)); positions.push_back( 1);
-    }
-    [encoder setVertexBytes:positions.data()
-                     length:positions.size() * sizeof(float)
-                    atIndex:0];
-    [encoder drawPrimitives:MTLPrimitiveTypeLine
-                vertexStart:0
-                vertexCount:positions.size() / 2];
-  }
 
   [encoder endEncoding];
 
@@ -358,11 +397,16 @@ void Draw() {
       [NSApp terminate:nil];
       break;
     case 0xf700:
-      viz_current_max += 500;
+      viz_power_max *= 2;
       break;
     case 0xf701:
-      if (viz_current_max > 500)
-        viz_current_max -= 500;
+      viz_power_max /= 2;
+      break;
+    case 0x2c:
+      viz_max_time -= 0.1f;
+      break;
+    case 0x2e:
+      viz_max_time += 0.1f;
       break;
     default:
       printf("Unsupported input 0x%x\n", [characters characterAtIndex:0]);
@@ -396,7 +440,7 @@ int main(int argc, char* argv[]) {
 
   [metalLayer setFrame:CGRectMake(0, 0, width, height)];
 
-  [window setTitle:@"Tiny Metal App"];
+  [window setTitle:@"BattOr Oscilloscope"];
   [window makeKeyAndOrderFront:nil];
 
   Draw();
