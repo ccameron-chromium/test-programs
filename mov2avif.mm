@@ -47,10 +47,6 @@ void CGAffineTransformToAVIF(CGAffineTransform t, uint8_t* irot_angle, uint8_t* 
 
 void DumpPixelBuffer(CVPixelBufferRef pixel_buffer) {
   CVPixelBufferLockBaseAddress(pixel_buffer, kCVPixelBufferLock_ReadOnly);
-  uint8_t* in_y = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
-  size_t in_y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0);
-  uint8_t* in_uv = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1);
-  size_t in_uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1);
   int width = CVPixelBufferGetWidth(pixel_buffer);
   int height = CVPixelBufferGetHeight(pixel_buffer);
 
@@ -66,8 +62,15 @@ void DumpPixelBuffer(CVPixelBufferRef pixel_buffer) {
     image->yuvRange = AVIF_RANGE_LIMITED;
     avifImageAllocatePlanes(image, AVIF_PLANES_YUV);
     {
+
       int plane_width = image->width;
       int plane_height = image->height;
+
+      uint8_t* in_y = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
+      size_t in_y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0);
+      CHECK(plane_width == CVPixelBufferGetWidthOfPlane(pixel_buffer, 0));
+      CHECK(plane_height == CVPixelBufferGetHeightOfPlane(pixel_buffer, 0));
+
       for (int y = 0; y < plane_height; ++y) {
         uint16_t* in_y_row = (uint16_t*)(in_y + y*in_y_stride);
         uint16_t* out_y_row = (uint16_t*)(image->yuvPlanes[AVIF_CHAN_Y] + y*image->yuvRowBytes[AVIF_CHAN_Y]);
@@ -77,6 +80,9 @@ void DumpPixelBuffer(CVPixelBufferRef pixel_buffer) {
       }
     }
     {
+      uint8_t* in_uv = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1);
+      size_t in_uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1);
+
       int plane_width = image->width / 2;
       int plane_height = image->height / 2;
       for (int y = 0; y < plane_height; ++y) {
@@ -252,13 +258,11 @@ void PrepareDecompressionSessionForCMSampleBuffer(
       &kCFTypeDictionaryKeyCallBacks,
       &kCFTypeDictionaryValueCallBacks);
   CHECK(decoder_parameters);
-  CFDictionarySetValue(decoder_parameters,
-      kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
-      kCFBooleanTrue);
-
-  // Retrieve the video dimensions (for the output pixel buffer attributes).
-  CMVideoDimensions cm_video_dimensions =
-      CMVideoFormatDescriptionGetDimensions(cm_video_format_description);
+  {
+    CFDictionarySetValue(decoder_parameters,
+        kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
+        kCFBooleanTrue);
+  }
 
   // Construct the output pixel buffer attributes.
   // This doen'st help.
@@ -268,21 +272,38 @@ void PrepareDecompressionSessionForCMSampleBuffer(
       &kCFTypeDictionaryKeyCallBacks,
       &kCFTypeDictionaryValueCallBacks);
   CHECK(pixel_buffer_attributes);
-  // None of these seem to make any difference.
-  CFDictionarySetValue(pixel_buffer_attributes,
-      kCVPixelBufferWidthKey, 
-      CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &cm_video_dimensions.width));
-  CFDictionarySetValue(pixel_buffer_attributes,
-      kCVPixelBufferHeightKey,
-      CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &cm_video_dimensions.height));
-  // CFDictionarySetValue(pixel_buffer_attributes,
-  //     kCVPixelBufferIOSurfaceCoreAnimationCompatibilityKey, kCFBooleanTrue);
+  {
+    // Retrieve the video dimensions (for the output pixel buffer attributes).
+    CMVideoDimensions cm_video_dimensions =
+        CMVideoFormatDescriptionGetDimensions(cm_video_format_description);
+
+    // None of these seem to make any difference.
+    CFDictionarySetValue(pixel_buffer_attributes,
+        kCVPixelBufferWidthKey, 
+        CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &cm_video_dimensions.width));
+    CFDictionarySetValue(pixel_buffer_attributes,
+        kCVPixelBufferHeightKey,
+        CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &cm_video_dimensions.height));
+
+    // This makes a big difference. Without it we get some &xvo format that... boh.
+    int32_t pixel_format = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+    CFDictionarySetValue(
+        pixel_buffer_attributes,
+        kCVPixelBufferPixelFormatTypeKey,
+        CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixel_format));
+
+    // Also doesn't seem to matter.
+    CFDictionarySetValue(pixel_buffer_attributes,
+        kCVPixelBufferIOSurfaceCoreAnimationCompatibilityKey, kCFBooleanTrue);
+  }
 
   // Configure the frame-is-decoded callback.
   VTDecompressionOutputCallbackRecord vt_decompression_callback_record;
-  vt_decompression_callback_record.decompressionOutputCallback =
-      DecompressionSessionOutputCallback;
-  vt_decompression_callback_record.decompressionOutputRefCon = 0;
+  {
+    vt_decompression_callback_record.decompressionOutputCallback =
+        DecompressionSessionOutputCallback;
+    vt_decompression_callback_record.decompressionOutputRefCon = 0;
+  }
 
   // Allocate the VTDecompressionSession.
   OSStatus decompression_session_create_status = VTDecompressionSessionCreate(

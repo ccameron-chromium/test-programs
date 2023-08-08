@@ -1,4 +1,4 @@
-// clang++ gen_avif_staircase.cc -lavif -O2 && ./a.out
+// clang++ staircase_generator.cc -lavif -O2 && ./a.out
 
 #include <stdio.h>
 #include <stdlib.h>
