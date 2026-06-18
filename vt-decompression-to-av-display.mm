@@ -39,6 +39,7 @@ CALayer* background_layer = nil;
 VTDecompressionSessionRef vt_decompression_session = 0;
 AVSampleBufferDisplayLayer* sample_display_layer = nil;
 CALayer* contents_layer = nil;
+CAMetalLayer* metal_layer = nil;
 typedef std::map<CFAbsoluteTime, CVImageBufferRef> TimeToFrameMap;
 TimeToFrameMap decoded_images;
 std::deque<CVImageBufferRef> displayed_images;
@@ -47,6 +48,16 @@ CVPixelBufferRef displaying_cv_pixel_buffer = nullptr;
 void DrawWithMetal(IOSurfaceRef io_surface) {
   static id<MTLDevice> device = nil;
   static id<MTLRenderPipelineState> renderPipelineState = nil;
+
+  if (!device) {
+    NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
+    if (!device) {
+      for (id<MTLDevice> test_device in devices) {
+        if (!device || [test_device isLowPower])
+          device = test_device;
+      }
+    }
+  }
 
   if (!renderPipelineState) {
     const char* shader_source = ""
@@ -65,6 +76,7 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
         "  out.clipSpacePosition = vector_float4(positions[vertexID], 0.0, 1.0);\n"
         "  out.texCoord = positions[vertexID] * 0.5 + 0.5;\n"
         "  out.texCoord.y = 1.0 - out.texCoord.y;\n"
+        "  out.texCoord.xy *= 4.0;\n"
         "  return out;\n"
         "}\n"
         "\n"
@@ -112,9 +124,36 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
     }
   }
 
+  if (!metal_layer) {
+    metal_layer = [[CAMetalLayer alloc] init];
+    metal_layer.device = device;
+    metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metal_layer.colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+
+    [background_layer addSublayer:metal_layer];
+    [metal_layer setFrame:CGRectMake(width/4, height/4, width/4, height/4)];
+  }
+
+  MTLPixelFormat y_format;
+  MTLPixelFormat uv_format;
+  switch (IOSurfaceGetPixelFormat(io_surface)) {
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange:
+      y_format = MTLPixelFormatR8Unorm;
+      uv_format = MTLPixelFormatRG8Unorm;
+      break;
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarVideoRange:
+      y_format = MTLPixelFormatR16Unorm;
+      uv_format = MTLPixelFormatRG16Unorm;
+      break;
+    default:
+      CHECK(!"unrecognized format...\n");
+  }
+
   // Bind planes to textures
   MTLTextureDescriptor *y_desc = [MTLTextureDescriptor
-      texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Unorm
+      texture2DDescriptorWithPixelFormat:y_format
                                    width:width
                                   height:height
                                mipmapped:NO];
@@ -122,7 +161,7 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
   id<MTLTexture> y_tex = [device newTextureWithDescriptor:y_desc iosurface:io_surface plane:0];
 
   MTLTextureDescriptor *uv_desc = [MTLTextureDescriptor
-      texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Unorm
+      texture2DDescriptorWithPixelFormat:uv_format
                                    width:width/2
                                   height:height/2
                                mipmapped:NO];
@@ -136,18 +175,15 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
 
   id<MTLCommandQueue> commandQueue = [device newCommandQueue];
   id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+  id<CAMetalDrawable> drawable = [metal_layer nextDrawable];
 
   id<MTLRenderCommandEncoder> encoder = nil;
   {
     MTLRenderPassDescriptor* desc = [MTLRenderPassDescriptor renderPassDescriptor];
-    desc.colorAttachments[0].texture = rgba_tex;
+    desc.colorAttachments[0].texture = drawable.texture;
     desc.colorAttachments[0].loadAction = MTLLoadActionClear;
     desc.colorAttachments[0].storeAction = MTLStoreActionStore;
-    desc.colorAttachments[0].clearColor = MTLClearColorMake(
-        0.5,
-        0.5,
-        0.5,
-        1.0);
+    desc.colorAttachments[0].clearColor = MTLClearColorMake(0.5, 0.5, 0.5, 1.0);
     encoder = [commandBuffer renderCommandEncoderWithDescriptor:desc];
   }
 
@@ -175,6 +211,7 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
   }
   [encoder endEncoding];
 
+  [commandBuffer presentDrawable:drawable];
   [commandBuffer commit];
   [commandBuffer waitUntilCompleted];
 
@@ -351,7 +388,7 @@ void PrepareDecompressionSessionForCMSampleBuffer(
 
     // This makes a big difference. Without it we get some &xvo format that... boh.
     int32_t pixel_format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    pixel_format = kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange;
+    // pixel_format = kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange;
     CFDictionarySetValue(
         pixel_buffer_attributes,
         kCVPixelBufferPixelFormatTypeKey,
@@ -444,6 +481,9 @@ void DisplayNextDecodedFrame(CVPixelBufferRef cv_pixel_buffer) {
   IOSurfaceRef io_surface = CVPixelBufferGetIOSurface(cv_pixel_buffer);
   DumpIOSurface(io_surface);
   [contents_layer setContents:(id)io_surface];
+
+  // Draw it with metal.
+  DrawWithMetal(io_surface);
   
   // Create the CMVideoFormatDescription.
   OSStatus status;
