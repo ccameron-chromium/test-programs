@@ -5,6 +5,8 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreVideo/CoreVideo.h>
+#include <Metal/Metal.h>
+#include <MetalKit/MetalKit.h>
 #include <VideoToolbox/VTDecompressionSession.h>
 #include <map>
 #include <deque>
@@ -36,13 +38,150 @@ int frame_count = 0;
 CALayer* background_layer = nil;
 VTDecompressionSessionRef vt_decompression_session = 0;
 AVSampleBufferDisplayLayer* sample_display_layer = nil;
+CALayer* contents_layer = nil;
 typedef std::map<CFAbsoluteTime, CVImageBufferRef> TimeToFrameMap;
 TimeToFrameMap decoded_images;
 std::deque<CVImageBufferRef> displayed_images;
 CVPixelBufferRef displaying_cv_pixel_buffer = nullptr;
 
-void DumpPixelBuffer(CVPixelBufferRef pixel_buffer) {
-  IOSurfaceRef io_surface = CVPixelBufferGetIOSurface(pixel_buffer);
+void DrawWithMetal(IOSurfaceRef io_surface) {
+  static id<MTLDevice> device = nil;
+  static id<MTLRenderPipelineState> renderPipelineState = nil;
+
+  if (!renderPipelineState) {
+    const char* shader_source = ""
+        "#include <metal_stdlib>\n"
+        "#include <simd/simd.h>\n"
+        "using namespace metal;\n"
+        "typedef struct {\n"
+        "    float4 clipSpacePosition [[position]];\n"
+        "    float2 texCoord;\n"
+        "} RasterizerData;\n"
+        "\n"
+        "vertex RasterizerData vertexShader(\n"
+        "    uint vertexID [[vertex_id]],\n"
+        "    constant vector_float2 *positions[[buffer(0)]]) {\n"
+        "  RasterizerData out;\n"
+        "  out.clipSpacePosition = vector_float4(positions[vertexID], 0.0, 1.0);\n"
+        "  out.texCoord = positions[vertexID] * 0.5 + 0.5;\n"
+        "  out.texCoord.y = 1.0 - out.texCoord.y;\n"
+        "  return out;\n"
+        "}\n"
+        "\n"
+        "fragment float4 fragmentShader(RasterizerData in [[stage_in]],\n"
+        "                               texture2d<float> y_tex [[texture(0)]],\n"
+        "                               texture2d<float> uv_tex [[texture(1)]]) {\n"
+        "    sampler s(mag_filter::linear, min_filter::linear);\n"
+        "    float r = y_tex.sample(s, in.texCoord).r;\n"
+        "    float2 gb = uv_tex.sample(s, in.texCoord).rg;\n"
+        "    return float4(r, gb.x, gb.y, 1.0);\n"
+        "}\n"
+        "";
+ 
+    id<MTLLibrary> library = nil;
+    {
+      NSError* error = nil;
+      NSString* source = [[NSString alloc] initWithCString:shader_source
+                                                  encoding:NSASCIIStringEncoding];
+      MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+      library = [device newLibraryWithSource:source
+                                     options:options
+                                       error:&error];
+      if (error)
+        NSLog(@"Failed to compile shader: %@", error);
+    }
+    id<MTLFunction> vertexFunction = [library newFunctionWithName:@"vertexShader"];
+    id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"fragmentShader"];
+    {
+      NSError* error = nil;
+      MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+      desc.label = @"Simple Pipeline";
+      desc.vertexFunction = vertexFunction;
+      desc.fragmentFunction = fragmentFunction;
+      desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Unorm;
+      desc.colorAttachments[0].blendingEnabled = YES;
+      desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+ 
+      renderPipelineState = [device newRenderPipelineStateWithDescriptor:desc
+                                                                   error:&error];
+      if (error)
+        NSLog(@"Failed to create render pipeline state: %@", error);
+    }
+  }
+
+  // Bind planes to textures
+  MTLTextureDescriptor *y_desc = [MTLTextureDescriptor
+      texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Unorm
+                                   width:width
+                                  height:height
+                               mipmapped:NO];
+  y_desc.usage = MTLTextureUsageShaderRead;
+  id<MTLTexture> y_tex = [device newTextureWithDescriptor:y_desc iosurface:io_surface plane:0];
+
+  MTLTextureDescriptor *uv_desc = [MTLTextureDescriptor
+      texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Unorm
+                                   width:width/2
+                                  height:height/2
+                               mipmapped:NO];
+  uv_desc.usage = MTLTextureUsageShaderRead;
+  id<MTLTexture> uv_tex = [device newTextureWithDescriptor:uv_desc iosurface:io_surface plane:1];
+
+  if (!y_tex || !uv_tex) {
+    NSLog(@"Failed to create Metal textures from IOSurface planes");
+    exit(1);
+  }
+
+  id<MTLCommandQueue> commandQueue = [device newCommandQueue];
+  id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+
+  id<MTLRenderCommandEncoder> encoder = nil;
+  {
+    MTLRenderPassDescriptor* desc = [MTLRenderPassDescriptor renderPassDescriptor];
+    desc.colorAttachments[0].texture = rgba_tex;
+    desc.colorAttachments[0].loadAction = MTLLoadActionClear;
+    desc.colorAttachments[0].storeAction = MTLStoreActionStore;
+    desc.colorAttachments[0].clearColor = MTLClearColorMake(
+        0.5,
+        0.5,
+        0.5,
+        1.0);
+    encoder = [commandBuffer renderCommandEncoderWithDescriptor:desc];
+  }
+
+  {
+    MTLViewport viewport;
+    viewport.originX = 0;
+    viewport.originY = 0;
+    viewport.width = width;
+    viewport.height = height;
+    viewport.znear = -1.0;
+    viewport.zfar = 1.0;
+    [encoder setViewport:viewport];
+    [encoder setRenderPipelineState:renderPipelineState];
+    vector_float2 positions[6] = {
+      { 1, -1 }, { -1, -1 }, { -1, 1 }, { -1, 1 }, { 1, 1 }, { 1, -1 },
+    };
+    [encoder setVertexBytes:positions
+                     length:sizeof(positions)
+                    atIndex:0];
+    [encoder setFragmentTexture:y_tex atIndex:0];
+    [encoder setFragmentTexture:uv_tex atIndex:1];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+                vertexStart:0
+                vertexCount:6];
+  }
+  [encoder endEncoding];
+
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+
+}
+
+void DumpIOSurface(IOSurfaceRef io_surface) {
+  printf("================= DumpIOSurface =================\n");
 
   // Overriding this seems not to do anything...
   // CVBufferSetAttachment(pixel_buffer, CFSTR("CGColorSpace"), kCGColorSpaceSRGB, kCVAttachmentMode_ShouldPropagate);
@@ -55,54 +194,34 @@ void DumpPixelBuffer(CVPixelBufferRef pixel_buffer) {
   // IOSurfaceSetValue(io_surface, CFSTR("IOSurfaceColorSpace"), CFSTR(""));
   // IOSurfaceSetValue(io_surface, CFSTR("IOSurfaceColorSpace"), kCGColorSpaceITUR_709);
 
-  CFShow(pixel_buffer);
   CFShow(io_surface);
   CFShow(IOSurfaceCopyAllValues(io_surface));
 
-
-  if (CVPixelBufferLockBaseAddress(pixel_buffer, kCVPixelBufferLock_ReadOnly)) {
-    return;
-  }
-  int width = CVPixelBufferGetWidth(pixel_buffer);
-  int height = CVPixelBufferGetHeight(pixel_buffer);
-
-  uint8_t yuv[3];
-  int x = 400;
-  int y = 400;
-  if (x >= width || y >= height)
+  if (!io_surface)
     return;
 
-  {
-    uint8_t* in_y = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
-    size_t in_y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0);
-
-    uint8_t* in_y_row = (uint8_t*)(in_y + y*in_y_stride);
-    yuv[0] = in_y_row[x];
+  if (IOSurfaceLock(io_surface, kIOSurfaceLockReadOnly, nullptr)) {
+    printf("*!*!*!*! Failed to lock IOSurface!\n");
+    return;
   }
-  {
-    uint8_t* in_uv = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1);
-    size_t in_uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1);
+  printf("Locked IOSurface, dumping\n");
+  int width = IOSurfaceGetWidth(io_surface);
+  int height = IOSurfaceGetHeight(io_surface);
+  printf("  width:%d, height:%d\n", width, height);
 
-    uint8_t* in_uv_row = (uint8_t*)(in_uv + (y/2)*in_uv_stride);
-    yuv[1] = in_uv_row[2*(x/2)];
-    yuv[2] = in_uv_row[2*(x/2)+1];
+  constexpr size_t kMaxNumPlanes = 4;
+  size_t num_planes = IOSurfaceGetPlaneCount(io_surface);
+  for (size_t p = 0; p < num_planes; ++p) {
+    size_t width     = IOSurfaceGetWidthOfPlane(io_surface, p);
+    size_t height    = IOSurfaceGetHeightOfPlane(io_surface, p);
+    size_t row_bytes = IOSurfaceGetBytesPerRowOfPlane(io_surface, p);
+    size_t pixel_bytes = IOSurfaceGetBytesPerElementOfPlane(io_surface, p);
+    void* base = IOSurfaceGetBaseAddressOfPlane(io_surface, p);
+    printf("  plane:%d width:%d, height:%d, row_bytes:%d, pixel_bytes:%d\n",
+        (int)p, (int)width, (int)height, (int)row_bytes, (int)pixel_bytes);
   }
 
-
-  const float Rec709_limited_yuv_to_rgb[] = {
-        1.164384f, -0.000000f,  1.792741f,  0.000000f, -0.972945f,
-        1.164384f, -0.213249f, -0.532909f,  0.000000f,  0.301483f,
-        1.164384f,  2.112402f, -0.000000f,  0.000000f, -1.133402f,
-        0.000000f,  0.000000f,  0.000000f,  1.000000f,  0.000000f,
-  };
-
-  const float* m = Rec709_limited_yuv_to_rgb;
-  uint8_t r = std::round(255*(m[ 0]*yuv[0]/255.f + m[ 1]*yuv[1]/255.f + m[ 2]*yuv[2]/255.f + m[ 4]));
-  uint8_t g = std::round(255*(m[ 5]*yuv[0]/255.f + m[ 6]*yuv[1]/255.f + m[ 7]*yuv[2]/255.f + m[ 9]));
-  uint8_t b = std::round(255*(m[10]*yuv[0]/255.f + m[11]*yuv[1]/255.f + m[12]*yuv[2]/255.f + m[14]));
-
-  printf("400,400 has y:%u,u:%u,v:%u -> r:%u,g:%u,b:%u\n", yuv[0], yuv[1], yuv[2], r,g,b);
-  CVPixelBufferUnlockBaseAddress(pixel_buffer, kCVPixelBufferLock_ReadOnly);
+  IOSurfaceUnlock(io_surface, kIOSurfaceLockReadOnly, nullptr);
 }
 
 // Read an entire mp4 file in filename into cm_sample_buffers_from_asset_reader.
@@ -144,12 +263,17 @@ void ReadFileFromDisk(const char* filename) {
 void InitializeLayer() {
   [sample_display_layer removeFromSuperlayer];
   [sample_display_layer release];
-  sample_display_layer = nil;
-
   sample_display_layer = [[AVSampleBufferDisplayLayer alloc] init];
-  [sample_display_layer setBackgroundColor:CGColorGetConstantColor(kCGColorBlack)];
+  [sample_display_layer setFrame:CGRectMake(0, 0, width/4, height/4)];
   [background_layer addSublayer:sample_display_layer];
-  [sample_display_layer setFrame:CGRectMake(0, 0, width/2, height/2)];
+
+  [contents_layer removeFromSuperlayer];
+  [contents_layer release];
+  contents_layer = [[CALayer alloc] init];
+  [contents_layer setFrame:CGRectMake(0, height/4, width/4, height/4)];
+  [background_layer addSublayer:contents_layer];
+
+  // [sample_display_layer setBackgroundColor:CGColorGetConstantColor(kCGColorBlack)];
 }
 
 static void DecompressionSessionOutputCallback(
@@ -227,6 +351,7 @@ void PrepareDecompressionSessionForCMSampleBuffer(
 
     // This makes a big difference. Without it we get some &xvo format that... boh.
     int32_t pixel_format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    pixel_format = kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange;
     CFDictionarySetValue(
         pixel_buffer_attributes,
         kCVPixelBufferPixelFormatTypeKey,
@@ -313,21 +438,15 @@ void DisplayNextDecodedFrame(CVPixelBufferRef cv_pixel_buffer) {
     frame_count += 1;
   }
   displaying_cv_pixel_buffer = cv_pixel_buffer;
-  DumpPixelBuffer(cv_pixel_buffer);
-  
   CHECK(cv_pixel_buffer);
-  OSStatus status;
 
-/*
-  CVBufferSetAttachment(cv_pixel_buffer,
-                        kCVImageBufferTransferFunctionKey,
-                        kCVImageBufferTransferFunction_ITU_R_709_2,
-                        // kCVImageBufferTransferFunction_sRGB,
-                        // kCVImageBufferTransferFunction_ITU_R_2100_HLG,
-                        kCVAttachmentMode_ShouldPropagate);
-*/
-
+  // Stuff IOSurface to contents of layer.
+  IOSurfaceRef io_surface = CVPixelBufferGetIOSurface(cv_pixel_buffer);
+  DumpIOSurface(io_surface);
+  [contents_layer setContents:(id)io_surface];
+  
   // Create the CMVideoFormatDescription.
+  OSStatus status;
   CMVideoFormatDescriptionRef video_info = NULL;
   status = CMVideoFormatDescriptionCreateForImageBuffer(NULL, cv_pixel_buffer, &video_info);
   CHECK(!status);
@@ -394,7 +513,6 @@ void DisplayNextDecodedFrame(CVPixelBufferRef cv_pixel_buffer) {
   float time = map_iter->first;
   CVPixelBufferRef cv_pixel_buffer = map_iter->second;
   decoded_images.erase(map_iter);
-
   DisplayNextDecodedFrame(cv_pixel_buffer);
 
   // The decoded images list should never grow beyond 8.
@@ -425,7 +543,7 @@ int main(int argc, char* argv[]) {
 
   window = [[MainWindow alloc]
     initWithContentRect:NSMakeRect(100, 100, width/2, height/2)
-    styleMask:0
+    styleMask:NSWindowStyleMaskTitled
     backing:NSBackingStoreBuffered
     defer:NO];
   [window setOpaque:YES];
