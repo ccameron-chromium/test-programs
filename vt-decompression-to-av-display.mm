@@ -84,9 +84,14 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
         "                               texture2d<float> y_tex [[texture(0)]],\n"
         "                               texture2d<float> uv_tex [[texture(1)]]) {\n"
         "    sampler s(mag_filter::linear, min_filter::linear);\n"
-        "    float r = y_tex.sample(s, in.texCoord).r;\n"
-        "    float2 gb = uv_tex.sample(s, in.texCoord).rg;\n"
-        "    return float4(r, gb.x, gb.y, 1.0);\n"
+        "    float4 yuv1 = float4(y_tex.sample(s, in.texCoord).r,\n"
+        "                         uv_tex.sample(s, in.texCoord).rg,\n"
+        "                         1.0);\n"
+        "    float4x4 yuv2rgb = float4x4(1.164384, -0.000000,  1.596027, -0.874202,\n"
+        "                                1.164384, -0.391762, -0.812968,  0.531668,\n"
+        "                                1.164384,  2.017232,  0.000000, -1.085631,\n"
+        "                                0.0,       0.0,       0.0,       1.0);\n"
+        "    return transpose(yuv2rgb) * yuv1;\n"
         "}\n"
         "";
  
@@ -110,7 +115,7 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
       desc.label = @"Simple Pipeline";
       desc.vertexFunction = vertexFunction;
       desc.fragmentFunction = fragmentFunction;
-      desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Unorm;
+      desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
       desc.colorAttachments[0].blendingEnabled = YES;
       desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
       desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
