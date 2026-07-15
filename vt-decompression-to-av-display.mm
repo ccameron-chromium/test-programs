@@ -1,4 +1,11 @@
-// clang++ vt-decompression-to-av-display.mm -framework AVFoundation -framework QuartzCore -framework CoreMedia -framework VideoToolbox -framework Cocoa -framework IOSurface -O2 && ./a.out test.mov
+/*
+Build and run using:
+clang++ vt-decompression-to-av-display.mm \
+  -framework Cocoa -framework QuartzCore \
+  -framework AVFoundation -framework CoreMedia -framework VideoToolbox \
+  -framework IOSurface -framework Metal -framework MetalKit \
+  && ./a.out test.mov
+*/
 
 #include <Cocoa/Cocoa.h>
 #include <AVFoundation/AVFoundation.h>
@@ -23,6 +30,9 @@
 @interface MainWindow : NSWindow
 - (void)tick;
 @end
+
+int decompression_pixel_format = kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange;
+// Also try kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
 
 AVAssetReaderOutput* asset_reader_output = nil;
 AVAsset* asset = nil;
@@ -136,6 +146,8 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
     metal_layer.colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
 
     [background_layer addSublayer:metal_layer];
+
+    printf("CAMetalLayer setContents: is in top-right\n");
     [metal_layer setFrame:CGRectMake(width/4, height/4, width/4, height/4)];
   }
 
@@ -234,7 +246,8 @@ void DumpIOSurface(IOSurfaceRef io_surface) {
 
   // And this will make the color space be Rec709 (signal value 10 maps to sRGB 24!).
   // IOSurfaceSetValue(io_surface, CFSTR("IOSurfaceColorSpace"), CFSTR(""));
-  // IOSurfaceSetValue(io_surface, CFSTR("IOSurfaceColorSpace"), kCGColorSpaceITUR_709);
+  // IOSurfaceSetValue(io_surface, CFSTR("IOSurfaceTransferFunction"), kCVImageBufferTransferFunction_sRGB);
+
 
   CFShow(io_surface);
   CFShow(IOSurfaceCopyAllValues(io_surface));
@@ -290,19 +303,13 @@ void ReadFileFromDisk(const char* filename) {
   CHECK(!error);
   [asset_reader addOutput:asset_reader_output];
   [asset_reader startReading];
-
-  /*
-  printf("getting orientation\n");
-  fflush(stdout);
-  CGAffineTransformToAVIF([video_track preferredTransform],
-                          &avif_irot_angle,
-                          &avif_imir_mode);
-  printf("angle:%d, mode:%d\n", avif_irot_angle, avif_imir_mode);
-  */
 }
 
 // Initialize the CALayer, which will have its contents set to each frame.
 void InitializeLayer() {
+  printf("AVSampleBufferDisplayLayer is in bottom-left\n");
+  printf("CALayer setContents: is in top-left\n");
+
   [sample_display_layer removeFromSuperlayer];
   [sample_display_layer release];
   sample_display_layer = [[AVSampleBufferDisplayLayer alloc] init];
@@ -314,8 +321,6 @@ void InitializeLayer() {
   contents_layer = [[CALayer alloc] init];
   [contents_layer setFrame:CGRectMake(0, height/4, width/4, height/4)];
   [background_layer addSublayer:contents_layer];
-
-  // [sample_display_layer setBackgroundColor:CGColorGetConstantColor(kCGColorBlack)];
 }
 
 static void DecompressionSessionOutputCallback(
@@ -363,12 +368,6 @@ void PrepareDecompressionSessionForCMSampleBuffer(
       &kCFTypeDictionaryKeyCallBacks,
       &kCFTypeDictionaryValueCallBacks);
   CHECK(decoder_parameters);
-  if (0)
-  {
-    CFDictionarySetValue(decoder_parameters,
-        kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
-        kCFBooleanTrue);
-  }
 
   // Construct the output pixel buffer attributes.
   // This doen'st help.
@@ -382,26 +381,33 @@ void PrepareDecompressionSessionForCMSampleBuffer(
     // Retrieve the video dimensions (for the output pixel buffer attributes).
     CMVideoDimensions cm_video_dimensions =
         CMVideoFormatDescriptionGetDimensions(cm_video_format_description);
+    int32_t pixel_format = decompression_pixel_format;
 
-    // None of these seem to make any difference.
-    // CFDictionarySetValue(pixel_buffer_attributes,
-    //     kCVPixelBufferWidthKey, 
-    //     CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &cm_video_dimensions.width));
-    // CFDictionarySetValue(pixel_buffer_attributes,
-    //     kCVPixelBufferHeightKey,
-    //     CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &cm_video_dimensions.height));
-
-    // This makes a big difference. Without it we get some &xvo format that... boh.
-    int32_t pixel_format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    // pixel_format = kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange;
     CFDictionarySetValue(
         pixel_buffer_attributes,
         kCVPixelBufferPixelFormatTypeKey,
         CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixel_format));
 
-    // Also doesn't seem to matter.
-    // CFDictionarySetValue(pixel_buffer_attributes,
-    //     kCVPixelBufferIOSurfaceCoreAnimationCompatibilityKey, kCFBooleanTrue);
+/*
+    // Setting properties here was thought to override the color space, but it
+    // appears not to (but maybe it only overrides somet things ...).
+    CFDictionarySetValue(
+        pixel_buffer_attributes,
+        kCVImageBufferTransferFunctionKey,
+        kCVImageBufferTransferFunction_sRGB);
+    CFDictionarySetValue(
+        pixel_buffer_attributes,
+        kCVImageBufferColorPrimariesKey,
+        kCVImageBufferColorPrimaries_ITU_R_709_2);
+    CFDictionarySetValue(
+        pixel_buffer_attributes,
+        kCVImageBufferYCbCrMatrixKey,
+        kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+    CFDictionarySetValue(
+        pixel_buffer_attributes,
+        kCVImageBufferCGColorSpaceKey,
+        CFSTR(""));
+*/
   }
 
   // Configure the frame-is-decoded callback.
@@ -474,6 +480,26 @@ void DecodeSeveralFrames() {
 }
 
 void DisplayNextDecodedFrame(CVPixelBufferRef cv_pixel_buffer) {
+  /*
+  // To override the color space, we need to strip the CGColorSpace attachment,
+  // and set the kCVImageBufferTransferFunctionKey. The CGColorSpace attachment
+  // appears have higher precedence.
+  CVBufferRemoveAttachment(cv_pixel_buffer, CFSTR("CGColorSpace"));
+  CVBufferRemoveAttachment(cv_pixel_buffer, CFSTR("DolbyVisionRPUData"));
+  CVBufferRemoveAttachment(cv_pixel_buffer, CFSTR("AmbientViewingEnvironment"));
+
+  // Setting this value will propagate it all the way down to the IOSurface.
+  CVBufferSetAttachment(cv_pixel_buffer,
+      kCVImageBufferTransferFunctionKey,
+      kCVImageBufferTransferFunction_ITU_R_709_2,
+      kCVAttachmentMode_ShouldPropagate);
+  */
+
+  printf("===== CVBufferCopyAttachments =====\n");
+  CFShow(CVBufferCopyAttachments(cv_pixel_buffer, kCVAttachmentMode_ShouldNotPropagate));
+  CFShow(CVBufferCopyAttachments(cv_pixel_buffer, kCVAttachmentMode_ShouldPropagate));
+
+
   if (displaying_cv_pixel_buffer) {
     CFRelease(displaying_cv_pixel_buffer);
     displaying_cv_pixel_buffer = nullptr;
@@ -602,7 +628,7 @@ int main(int argc, char* argv[]) {
 
   InitializeLayer();
 
-  [window setTitle:@"VTDecompressionSession AVSampleBufferDisplayLayer test"];
+  [window setTitle:@"VTDecompressionSession AVSampleBufferDisplayLayer CALayer+IOSurface, Metal test"];
   [window makeKeyAndOrderFront:nil];
   [window tick];
 
