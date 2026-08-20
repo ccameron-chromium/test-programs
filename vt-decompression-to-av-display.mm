@@ -436,6 +436,40 @@ void PrepareDecompressionSessionForCMSampleBuffer(
   CFRelease(pixel_buffer_attributes);
 }
 
+void PrintCMSampleBufferAttachments(CMSampleBufferRef cm_sample_buffer, const char* label) {
+  printf("===== CMSampleBuffer attachments: %s =====\n", label);
+  fflush(stdout);
+  CFDictionaryRef attachments = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, cm_sample_buffer, kCMAttachmentMode_ShouldPropagate);
+  if (attachments) {
+    printf("Buffer-level attachments (ShouldPropagate):\n");
+    fflush(stdout);
+    CFShow(attachments);
+    CFRelease(attachments);
+  }
+  attachments = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, cm_sample_buffer, kCMAttachmentMode_ShouldNotPropagate);
+  if (attachments) {
+    printf("Buffer-level attachments (ShouldNotPropagate):\n");
+    fflush(stdout);
+    CFShow(attachments);
+    CFRelease(attachments);
+  }
+  CFArrayRef sample_attachments = CMSampleBufferGetSampleAttachmentsArray(cm_sample_buffer, NO);
+  if (sample_attachments) {
+    printf("Sample-level attachments:\n");
+    fflush(stdout);
+    CFShow(sample_attachments);
+  }
+  CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(cm_sample_buffer);
+  if (format) {
+    CFDictionaryRef extensions = CMFormatDescriptionGetExtensions(format);
+    if (extensions) {
+      printf("Format description extensions:\n");
+      fflush(stdout);
+      CFShow(extensions);
+    }
+  }
+}
+
 IOSurfaceRef g_io_surface = 0;
 
 void DecodeSeveralFrames() {
@@ -450,6 +484,8 @@ void DecodeSeveralFrames() {
       [asset release];
       return;
     }
+
+    PrintCMSampleBufferAttachments(cm_sample_buffer, "from disk");
 
     // Pull the video format description from the sample buffer.
     CMVideoFormatDescriptionRef cm_video_format_description =
@@ -531,6 +567,8 @@ void DisplayNextDecodedFrame(CVPixelBufferRef cv_pixel_buffer) {
   status = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, cv_pixel_buffer, YES, NULL, NULL, video_info, &timing, &sample_buffer);
   CHECK(!status);
   CHECK(sample_buffer);
+
+  PrintCMSampleBufferAttachments(sample_buffer, "for display");
 
   // Set attachments on the CMSampleBuffer.
   CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample_buffer, YES);
