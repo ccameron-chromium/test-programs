@@ -7,20 +7,24 @@
 #include <CoreVideo/CoreVideo.h>
 #include <IOSurface/IOSurface.h>
 #include <QuartzCore/CALayer.h>
+#include <ImageIO/ImageIO.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <vector>
+#include <string>
 
 enum Mode {
   kPQ = 0,
 };
 
-const int width = 480;
-const int height = 240;
+const int width = 1280;
+const int height = 720;
 CALayer* root_layer = nil;
 
-CVPixelBufferRef pixel_buffer = nil;
 AVSampleBufferDisplayLayer* av_layer = nil;
+
+CFStringRef kCMSampleAttachmentKey_SMPTE2094_50Data = CFSTR("SMPTE2094-50Data");
 
 const float k100NitSignal = 0.508078421517399;
 const float k203NitSignal = 0.5806888810416109;
@@ -28,6 +32,23 @@ const float k250NitSignal = 0.6025591549907524;
 const float k500NitSignal = 0.6765848107833876;
 const float k1000NitSignal = 0.751827096247041;
 const float k10000NitSignal = 1.0;
+
+struct TestFrame {
+  int nits;
+  std::vector<uint8_t> data;
+  CVPixelBufferRef pixel_buffer;
+};
+
+std::vector<TestFrame> test_frames = {
+  {1, { 0x00, 0xc0, 0x00, 0x05, 0x00, 0x00, 0x04 }, nullptr},
+  {5, { 0x00, 0xc0, 0x00, 0x19, 0x00, 0x00, 0x04 }, nullptr},
+  {80, { 0x00, 0xc0, 0x01, 0x90, 0x00, 0x00, 0x04 }, nullptr},
+  {100, { 0x00, 0xc0, 0x01, 0xf4, 0x00, 0x00, 0x04 }, nullptr},
+  {203, { 0x00, 0x40, 0x00, 0x00, 0x04 }, nullptr},
+  {500, { 0x00, 0xc0, 0x09, 0xc4, 0x00, 0x00, 0x04 }, nullptr},
+  {1000, { 0x00, 0xc0, 0x13, 0x88, 0x00, 0x00, 0x04 }, nullptr},
+};
+
 
 #define CHECK(x) \
   do { \
@@ -63,71 +84,17 @@ CVPixelBufferRef CreateIOSurfaceUsingCVPixelBuffer() {
   return pixel_buffer;
 }
 
-void GreyToYUV(float grey, float* yuv) {
-  const float BT2020_10bit_limited_rgb_to_yuv[] = {
-        0.224951f,  0.580575f,  0.050779f,  0.000000f,  0.062561f,
-       -0.122296f, -0.315632f,  0.437928f,  0.000000f,  0.500489f,
-        0.437928f, -0.402706f, -0.035222f,  0.000000f,  0.500489f,
-        0.000000f,  0.000000f,  0.000000f,  1.000000f,  0.000000f,
-  };
-  const float* m = BT2020_10bit_limited_rgb_to_yuv;
-  const float rgb[5] = {grey, grey, grey, 1.f, 1.f};
-  for (size_t i = 0; i < 3; ++i) {
-    yuv[i] = 0;
-    for (size_t j = 0; j < 5; ++j) {
-      yuv[i] += m[5*i + j] * rgb[j];
-    }
-  }
-}
-
-// Write a gradient to |pixel_buffer|.
-void WriteGradientToPixelBuffer(CVPixelBufferRef pixel_buffer, float max_value) {
-  IOSurfaceRef io_surface = CVPixelBufferGetIOSurface(pixel_buffer);
-  CHECK(io_surface);
-
-  IOReturn r = IOSurfaceLock(io_surface, 0, nullptr);
-  CHECK(r == kIOReturnSuccess);
-
-  size_t plane_count = IOSurfaceGetPlaneCount(io_surface);
-  if (plane_count == 0)
-    plane_count = 1;
-  for (size_t plane = 0; plane < plane_count; ++plane) {
-    size_t plane_width = IOSurfaceGetWidthOfPlane(io_surface, plane);
-    size_t plane_height = IOSurfaceGetHeightOfPlane(io_surface, plane);
-    uint8_t* dst_data = reinterpret_cast<uint8_t*>(
-        IOSurfaceGetBaseAddressOfPlane(io_surface, plane));
-    size_t dst_stride = IOSurfaceGetBytesPerRowOfPlane(io_surface, plane);
-    size_t dst_bpe  = IOSurfaceGetBytesPerElementOfPlane(io_surface, plane);
-    for (size_t y = 0; y < plane_height; ++y) {
-      for (size_t x = 0; x < plane_width; ++x) {
-        float grey = max_value * (x / (plane_width - 1.f));
-        float yuv[3];
-        GreyToYUV(grey, yuv);
-
-        uint16_t* pixel = (uint16_t*)(dst_data + y*dst_stride + dst_bpe*x);
-        float factor = 65535.f;
-        if (plane == 0) {
-          pixel[0] = (int)(factor * yuv[0] + 0.5f);
-        } else {
-          pixel[0] = (int)(factor * yuv[1] + 0.5f);
-          pixel[1] = (int)(factor * yuv[2] + 0.5f);
-        }
-      }
-    }
-  }
-
-  r = IOSurfaceUnlock(io_surface, 0, nullptr);
-  CHECK(r == kIOReturnSuccess);
-}
+// Write |path| to |pixel_buffer|. Draw a 10x10 black square at centerX, centerY.
+void WriteImageToPixelBuffer(CVPixelBufferRef pixel_buffer, const char* path, int centerX, int centerY);
 
 // Draw |pixel_buffer| using an AVSampleBufferDisplayLayer.
-void UpdateAVLayer(CVPixelBufferRef pixel_buffer) {
+void UpdateAVLayer(const TestFrame& frame) {
   CHECK(av_layer);
   OSStatus os_status = noErr;
 
   CMVideoFormatDescriptionRef video_info;
   os_status = CMVideoFormatDescriptionCreateForImageBuffer(
-      nullptr, pixel_buffer, &video_info);
+      nullptr, frame.pixel_buffer, &video_info);
   CHECK(os_status == noErr);
 
   // The frame time doesn't matter because we will specify to display
@@ -137,11 +104,11 @@ void UpdateAVLayer(CVPixelBufferRef pixel_buffer) {
 
   CMSampleBufferRef sample_buffer;
   os_status = CMSampleBufferCreateForImageBuffer(
-      nullptr, pixel_buffer, YES, nullptr, nullptr, video_info, &timing_info,
+      nullptr, frame.pixel_buffer, YES, nullptr, nullptr, video_info, &timing_info,
       &sample_buffer);
   CHECK(os_status == noErr);
 
-  // Specify to display immediately via the sample buffer attachments.
+  // Get the CMSampleBuffer attachment dictionary.
   CFArrayRef attachments =
       CMSampleBufferGetSampleAttachmentsArray(sample_buffer, YES);
   CHECK(attachments);
@@ -150,15 +117,36 @@ void UpdateAVLayer(CVPixelBufferRef pixel_buffer) {
       reinterpret_cast<CFMutableDictionaryRef>(
           const_cast<void*>(CFArrayGetValueAtIndex(attachments, 0)));
   CHECK(attachments_dictionary);
+
+  //  Specify to display immediately
   CFDictionarySetValue(attachments_dictionary,
                        kCMSampleAttachmentKey_DisplayImmediately,
                        kCFBooleanTrue);
+
+  // Specify the 2094-50 HDR metadata.
+  CFDataRef metadata_data = CFDataCreate(kCFAllocatorDefault, frame.data.data(), frame.data.size());
+  CFDictionarySetValue(attachments_dictionary,
+                       kCMSampleAttachmentKey_SMPTE2094_50Data,
+                       metadata_data);
+  CFRelease(metadata_data);
+
   [av_layer enqueueSampleBuffer:sample_buffer];
 
   AVQueuedSampleBufferRenderingStatus status = [av_layer status];
   CHECK(status == AVQueuedSampleBufferRenderingStatusRendering);
 }
 
+
+void CycleFrames(int frame_index) {
+  const auto& frame = test_frames[frame_index];
+  printf("Drawing frame %d (%d nits)\n", frame_index, frame.nits);
+  UpdateAVLayer(frame);
+  
+  int next_index = (frame_index + 1) % test_frames.size();
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    CycleFrames(next_index);
+  });
+}
 
 @interface MainWindow : NSWindow
 @end
@@ -175,16 +163,6 @@ void UpdateAVLayer(CVPixelBufferRef pixel_buffer) {
   char c = [characters characterAtIndex:0];
   if (c == 'q') {
     [NSApp terminate:nil];
-  } else if (c == 'p') {
-    static float value = k203NitSignal;
-    printf("Drawing PQ\n");
-    WriteGradientToPixelBuffer(pixel_buffer, value);
-    UpdateAVLayer(pixel_buffer);
-    if (value == k203NitSignal) {
-      value = k100NitSignal;
-    } else {
-      value = k203NitSignal;
-    }
   }
 }
 @end
@@ -210,15 +188,125 @@ int main(int argc, char* argv[]) {
   [av_layer setFrame:CGRectMake(10, 10, width, height)];
   [root_layer addSublayer:av_layer];
 
-  pixel_buffer = CreateIOSurfaceUsingCVPixelBuffer();
+  for (size_t i = 0; i < test_frames.size(); ++i) {
+    test_frames[i].pixel_buffer = CreateIOSurfaceUsingCVPixelBuffer();
+    WriteImageToPixelBuffer(test_frames[i].pixel_buffer, "staircase-pq.png", 80 + 160 * i, 720 - 80);
+  }
 
   [window setTitle:@"Single-process PQ example!"];
   [window makeKeyAndOrderFront:nil];
 
-  printf("Press 'p' to view PQ\n");
-  printf("The window contains an AVSampleBufferDisplayLayer.\n");
+  printf("Cycling through %zu test frames at 2 FPS\n", test_frames.size());
+  CycleFrames(0);
 
   [NSApp activateIgnoringOtherApps:YES];
   [NSApp run];
   return 0;
 }
+
+//
+//
+// Frame pixel value initialization code...
+//
+//
+
+// Write |path| to |pixel_buffer|. Draw a 10x10 black square at centerX, centerY.
+void WriteImageToPixelBuffer(CVPixelBufferRef pixel_buffer, const char* path, int centerX, int centerY) {
+  NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+  CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr);
+  CHECK(source);
+  CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+  CHECK(image);
+  CFRelease(source);
+
+  std::vector<uint16_t> rgb_data(width * height * 4);
+  CGColorSpaceRef color_space = CGImageGetColorSpace(image);
+  if (!color_space) {
+    color_space = CGColorSpaceCreateDeviceRGB();
+  } else {
+    CGColorSpaceRetain(color_space);
+  }
+  
+  CGContextRef context = CGBitmapContextCreate(
+      rgb_data.data(), width, height, 16, width * 8, color_space,
+      kCGBitmapByteOrder16Host | kCGImageAlphaNoneSkipLast);
+  CHECK(context);
+  // Disable interpolation and anti-aliasing to get the cleanest pixel transfer
+  CGContextSetInterpolationQuality(context, kCGInterpolationNone);
+  CGContextSetShouldAntialias(context, false);
+  
+  CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+
+  // Draw a black square (10x10).
+  CGContextSetRGBFillColor(context, 0, 0, 0, 1);
+  CGContextFillRect(context, CGRectMake(centerX - 5, centerY - 5, 10, 10));
+
+  CGContextRelease(context);
+  CGColorSpaceRelease(color_space);
+  CGImageRelease(image);
+
+  IOSurfaceRef io_surface = CVPixelBufferGetIOSurface(pixel_buffer);
+  CHECK(io_surface);
+
+  IOReturn r = IOSurfaceLock(io_surface, 0, nullptr);
+  CHECK(r == kIOReturnSuccess);
+
+  // m is the full-range RGB to video-range YUV matrix for BT2020.
+  const float m[] = {
+        0.224951f,  0.580575f,  0.050779f,  0.000000f,  0.062561f,
+       -0.122296f, -0.315632f,  0.437928f,  0.000000f,  0.500489f,
+        0.437928f, -0.402706f, -0.035222f,  0.000000f,  0.500489f,
+  };
+
+  size_t plane_count = IOSurfaceGetPlaneCount(io_surface);
+  if (plane_count == 0)
+    plane_count = 1;
+  for (size_t plane = 0; plane < plane_count; ++plane) {
+    size_t plane_width = IOSurfaceGetWidthOfPlane(io_surface, plane);
+    size_t plane_height = IOSurfaceGetHeightOfPlane(io_surface, plane);
+    uint8_t* dst_data = reinterpret_cast<uint8_t*>(
+        IOSurfaceGetBaseAddressOfPlane(io_surface, plane));
+    size_t dst_stride = IOSurfaceGetBytesPerRowOfPlane(io_surface, plane);
+    size_t dst_bpe  = IOSurfaceGetBytesPerElementOfPlane(io_surface, plane);
+    for (size_t y = 0; y < plane_height; ++y) {
+      for (size_t x = 0; x < plane_width; ++x) {
+        constexpr float kMaxRGB = 65535.f;
+        constexpr float kMaxYUV = 65472.f;
+        if (plane == 0) {
+          uint16_t* src_pixel = &rgb_data[(y * width + x) * 4];
+          float r_val = src_pixel[0] / kMaxRGB;
+          float g_val = src_pixel[1] / kMaxRGB;
+          float b_val = src_pixel[2] / kMaxRGB;
+          float y_val = m[0]*r_val + m[1]*g_val + m[2]*b_val + m[4];
+
+          uint16_t* dst_pixel = (uint16_t*)(dst_data + y*dst_stride + dst_bpe*x);
+          dst_pixel[0] = (int)(kMaxYUV * y_val + 0.5f);
+        } else {
+          // Chroma plane (interleaved CbCr)
+          // Average 2x2 neighborhood for chroma subsampling.
+          float cb_sum = 0;
+          float cr_sum = 0;
+          for (size_t dy = 0; dy < 2; ++dy) {
+            for (size_t dx = 0; dx < 2; ++dx) {
+              size_t sx = 2 * x + dx;
+              size_t sy = 2 * y + dy;
+              uint16_t* src_pixel = &rgb_data[(sy * width + sx) * 4];
+              float r_val = src_pixel[0] / kMaxRGB;
+              float g_val = src_pixel[1] / kMaxRGB;
+              float b_val = src_pixel[2] / kMaxRGB;
+              cb_sum += m[5]*r_val + m[6]*g_val + m[7]*b_val + m[9];
+              cr_sum += m[10]*r_val + m[11]*g_val + m[12]*b_val + m[14];
+            }
+          }
+          uint16_t* dst_pixel = (uint16_t*)(dst_data + y*dst_stride + dst_bpe*x);
+          dst_pixel[0] = (int)(kMaxYUV * (cb_sum / 4.f) + 0.5f);
+          dst_pixel[1] = (int)(kMaxYUV * (cr_sum / 4.f) + 0.5f);
+        }
+      }
+    }
+  }
+
+  r = IOSurfaceUnlock(io_surface, 0, nullptr);
+  CHECK(r == kIOReturnSuccess);
+}
+
