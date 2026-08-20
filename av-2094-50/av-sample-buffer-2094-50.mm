@@ -1,5 +1,7 @@
 // To build and run:
 // clang++ av-sample-buffer-2094-50.mm -framework Cocoa -framework QuartzCore -framework IOSurface -framework AVFoundation -framework CoreMedia -fobjc-arc && ./a.out
+// 
+// To run, you will need staircase-pq.png in your working directory.
 #include <AVFoundation/AVFoundation.h>
 #include <Cocoa/Cocoa.h>
 #include <CoreFoundation/CoreFoundation.h>
