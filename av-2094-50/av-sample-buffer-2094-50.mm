@@ -28,26 +28,24 @@ AVSampleBufferDisplayLayer* av_layer = nil;
 
 CFStringRef kCMSampleAttachmentKey_SMPTE2094_50Data = CFSTR("SMPTE2094-50Data");
 
-const float k100NitSignal = 0.508078421517399;
-const float k203NitSignal = 0.5806888810416109;
-const float k250NitSignal = 0.6025591549907524;
-const float k500NitSignal = 0.6765848107833876;
-const float k1000NitSignal = 0.751827096247041;
-const float k10000NitSignal = 1.0;
-
 struct TestFrame {
-  int nits;
+  // The number of nits that HDR reference white is set to in the matdata in `data`.
+  float nits;
+  // The 2094-50 metadata.
   std::vector<uint8_t> data;
+  // The pixels (which are the same for all frames, but with a square moving to
+  // indicate which frame is active).
   CVPixelBufferRef pixel_buffer;
 };
 
 std::vector<TestFrame> test_frames = {
-  {1, { 0x00, 0xc0, 0x00, 0x05, 0x00, 0x00, 0x04 }, nullptr},
-  {5, { 0x00, 0xc0, 0x00, 0x19, 0x00, 0x00, 0x04 }, nullptr},
-  {80, { 0x00, 0xc0, 0x01, 0x90, 0x00, 0x00, 0x04 }, nullptr},
-  {100, { 0x00, 0xc0, 0x01, 0xf4, 0x00, 0x00, 0x04 }, nullptr},
-  {203, { 0x00, 0x40, 0x00, 0x00, 0x04 }, nullptr},
-  {500, { 0x00, 0xc0, 0x09, 0xc4, 0x00, 0x00, 0x04 }, nullptr},
+  {1,    { 0x00, 0xc0, 0x00, 0x05, 0x00, 0x00, 0x04 }, nullptr},
+  {5,    { 0x00, 0xc0, 0x00, 0x19, 0x00, 0x00, 0x04 }, nullptr},
+  {43.8, { 0x00, 0xc0, 0x00, 0xdb, 0x00, 0x00, 0x04 }, nullptr},
+  {80,   { 0x00, 0xc0, 0x01, 0x90, 0x00, 0x00, 0x04 }, nullptr},
+  {100,  { 0x00, 0xc0, 0x01, 0xf4, 0x00, 0x00, 0x04 }, nullptr},
+  {203,  { 0x00, 0x40, 0x00, 0x00, 0x04 }, nullptr},
+  {500,  { 0x00, 0xc0, 0x09, 0xc4, 0x00, 0x00, 0x04 }, nullptr},
   {1000, { 0x00, 0xc0, 0x13, 0x88, 0x00, 0x00, 0x04 }, nullptr},
 };
 
@@ -141,7 +139,7 @@ void UpdateAVLayer(const TestFrame& frame) {
 
 void CycleFrames(int frame_index) {
   const auto& frame = test_frames[frame_index];
-  printf("Drawing frame %d (%d nits)\n", frame_index, frame.nits);
+  printf("Drawing frame %d (%f nits)\n", frame_index, frame.nits);
   UpdateAVLayer(frame);
   
   int next_index = (frame_index + 1) % test_frames.size();
