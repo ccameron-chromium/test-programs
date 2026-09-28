@@ -31,8 +31,13 @@ clang++ vt-decompression-to-av-display.mm \
 - (void)tick;
 @end
 
-int decompression_pixel_format = kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange;
-// Also try kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+int decompression_pixel_format = 
+    // kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange;
+    // kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+    // kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarVideoRange;
+
+
 
 AVAssetReaderOutput* asset_reader_output = nil;
 AVAsset* asset = nil;
@@ -50,10 +55,114 @@ VTDecompressionSessionRef vt_decompression_session = 0;
 AVSampleBufferDisplayLayer* sample_display_layer = nil;
 CALayer* contents_layer = nil;
 CAMetalLayer* metal_layer = nil;
+CAMetalLayer* metal_copy_layer = nil;
 typedef std::map<CFAbsoluteTime, CVImageBufferRef> TimeToFrameMap;
 TimeToFrameMap decoded_images;
 std::deque<CVImageBufferRef> displayed_images;
 CVPixelBufferRef displaying_cv_pixel_buffer = nullptr;
+
+void AddQuadrantLabel(NSString* text, CGRect quadrant_frame) {
+  const CGFloat kLabelHeight = 24.0;
+  CATextLayer* label = [[CATextLayer alloc] init];
+  label.string = text;
+  label.fontSize = 14.0;
+  label.foregroundColor = CGColorGetConstantColor(kCGColorWhite);
+  CGColorRef bg_color = CGColorCreateGenericRGB(0.0, 0.0, 0.0, 0.6);
+  label.backgroundColor = bg_color;
+  CGColorRelease(bg_color);
+  label.alignmentMode = kCAAlignmentCenter;
+  label.contentsScale = [window backingScaleFactor];
+  label.zPosition = 1.0;
+  label.frame = CGRectMake(
+      CGRectGetMinX(quadrant_frame),
+      CGRectGetMaxY(quadrant_frame) - kLabelHeight,
+      CGRectGetWidth(quadrant_frame),
+      kLabelHeight);
+  [background_layer addSublayer:label];
+  [label release];
+}
+
+id<MTLTexture> CopyTextureThroughBuffer(id<MTLDevice> device,
+                                        id<MTLCommandBuffer> commandBuffer,
+                                        id<MTLTexture> src_tex,
+                                        MTLTextureDescriptor* desc) {
+  NSUInteger tex_width = desc.width;
+  NSUInteger tex_height = desc.height;
+  NSUInteger bytes_per_pixel =
+      (desc.pixelFormat == MTLPixelFormatR8Unorm) ? 1 :
+      (desc.pixelFormat == MTLPixelFormatRG8Unorm ||
+       desc.pixelFormat == MTLPixelFormatR16Unorm) ? 2 : 4;
+  NSUInteger bytes_per_row = tex_width * bytes_per_pixel;
+  NSUInteger bytes_per_image = bytes_per_row * tex_height;
+
+  id<MTLBuffer> buffer =
+      [device newBufferWithLength:bytes_per_image
+                          options:MTLResourceStorageModeShared];
+  id<MTLTexture> dst_tex = [device newTextureWithDescriptor:desc];
+
+  id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+  [blit copyFromTexture:src_tex
+            sourceSlice:0
+            sourceLevel:0
+           sourceOrigin:MTLOriginMake(0, 0, 0)
+             sourceSize:MTLSizeMake(tex_width, tex_height, 1)
+               toBuffer:buffer
+      destinationOffset:0
+ destinationBytesPerRow:bytes_per_row
+destinationBytesPerImage:bytes_per_image];
+  [blit copyFromBuffer:buffer
+          sourceOffset:0
+     sourceBytesPerRow:bytes_per_row
+   sourceBytesPerImage:bytes_per_image
+            sourceSize:MTLSizeMake(tex_width, tex_height, 1)
+             toTexture:dst_tex
+      destinationSlice:0
+      destinationLevel:0
+     destinationOrigin:MTLOriginMake(0, 0, 0)];
+  [blit endEncoding];
+  [buffer release];
+  return dst_tex;
+}
+
+void DrawYUVTexturesToLayer(id<MTLCommandBuffer> commandBuffer,
+                            id<MTLRenderPipelineState> renderPipelineState,
+                            CAMetalLayer* layer,
+                            id<MTLTexture> y_tex,
+                            id<MTLTexture> uv_tex) {
+  id<CAMetalDrawable> drawable = [layer nextDrawable];
+
+  MTLRenderPassDescriptor* desc = [MTLRenderPassDescriptor renderPassDescriptor];
+  desc.colorAttachments[0].texture = drawable.texture;
+  desc.colorAttachments[0].loadAction = MTLLoadActionClear;
+  desc.colorAttachments[0].storeAction = MTLStoreActionStore;
+  desc.colorAttachments[0].clearColor = MTLClearColorMake(0.5, 0.5, 0.5, 1.0);
+  id<MTLRenderCommandEncoder> encoder =
+      [commandBuffer renderCommandEncoderWithDescriptor:desc];
+
+  MTLViewport viewport;
+  viewport.originX = 0;
+  viewport.originY = 0;
+  viewport.width = width;
+  viewport.height = height;
+  viewport.znear = -1.0;
+  viewport.zfar = 1.0;
+  [encoder setViewport:viewport];
+  [encoder setRenderPipelineState:renderPipelineState];
+  vector_float2 positions[6] = {
+    { 1, -1 }, { -1, -1 }, { -1, 1 }, { -1, 1 }, { 1, 1 }, { 1, -1 },
+  };
+  [encoder setVertexBytes:positions
+                   length:sizeof(positions)
+                  atIndex:0];
+  [encoder setFragmentTexture:y_tex atIndex:0];
+  [encoder setFragmentTexture:uv_tex atIndex:1];
+  [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+              vertexStart:0
+              vertexCount:6];
+  [encoder endEncoding];
+
+  [commandBuffer presentDrawable:drawable];
+}
 
 void DrawWithMetal(IOSurfaceRef io_surface) {
   static id<MTLDevice> device = nil;
@@ -148,7 +257,23 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
     [background_layer addSublayer:metal_layer];
 
     printf("CAMetalLayer setContents: is in top-right\n");
-    [metal_layer setFrame:CGRectMake(width/4, height/4, width/4, height/4)];
+    CGRect metal_frame = CGRectMake(width/4, height/4, width/4, height/4);
+    [metal_layer setFrame:metal_frame];
+    AddQuadrantLabel(@"CAMetalLayer (YUV->RGB shader)", metal_frame);
+  }
+
+  if (!metal_copy_layer) {
+    metal_copy_layer = [[CAMetalLayer alloc] init];
+    metal_copy_layer.device = device;
+    metal_copy_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metal_copy_layer.colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+
+    [background_layer addSublayer:metal_copy_layer];
+
+    printf("CAMetalLayer (copyFromTexture) is in bottom-right\n");
+    CGRect metal_copy_frame = CGRectMake(width/4, 0, width/4, height/4);
+    [metal_copy_layer setFrame:metal_copy_frame];
+    AddQuadrantLabel(@"CAMetalLayer (copyFromTexture->Buffer)", metal_copy_frame);
   }
 
   MTLPixelFormat y_format;
@@ -156,11 +281,13 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
   switch (IOSurfaceGetPixelFormat(io_surface)) {
     case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
     case kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange:
+      printf("** 8-bit format!\n");
       y_format = MTLPixelFormatR8Unorm;
       uv_format = MTLPixelFormatRG8Unorm;
       break;
     case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
     case kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarVideoRange:
+      printf("** 10-bit format!\n");
       y_format = MTLPixelFormatR16Unorm;
       uv_format = MTLPixelFormatRG16Unorm;
       break;
@@ -192,46 +319,25 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
 
   id<MTLCommandQueue> commandQueue = [device newCommandQueue];
   id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
-  id<CAMetalDrawable> drawable = [metal_layer nextDrawable];
 
-  id<MTLRenderCommandEncoder> encoder = nil;
-  {
-    MTLRenderPassDescriptor* desc = [MTLRenderPassDescriptor renderPassDescriptor];
-    desc.colorAttachments[0].texture = drawable.texture;
-    desc.colorAttachments[0].loadAction = MTLLoadActionClear;
-    desc.colorAttachments[0].storeAction = MTLStoreActionStore;
-    desc.colorAttachments[0].clearColor = MTLClearColorMake(0.5, 0.5, 0.5, 1.0);
-    encoder = [commandBuffer renderCommandEncoderWithDescriptor:desc];
-  }
+  // Top-right: sample directly from IOSurface-backed textures.
+  DrawYUVTexturesToLayer(commandBuffer, renderPipelineState, metal_layer, y_tex, uv_tex);
 
-  {
-    MTLViewport viewport;
-    viewport.originX = 0;
-    viewport.originY = 0;
-    viewport.width = width;
-    viewport.height = height;
-    viewport.znear = -1.0;
-    viewport.zfar = 1.0;
-    [encoder setViewport:viewport];
-    [encoder setRenderPipelineState:renderPipelineState];
-    vector_float2 positions[6] = {
-      { 1, -1 }, { -1, -1 }, { -1, 1 }, { -1, 1 }, { 1, 1 }, { 1, -1 },
-    };
-    [encoder setVertexBytes:positions
-                     length:sizeof(positions)
-                    atIndex:0];
-    [encoder setFragmentTexture:y_tex atIndex:0];
-    [encoder setFragmentTexture:uv_tex atIndex:1];
-    [encoder drawPrimitives:MTLPrimitiveTypeTriangle
-                vertexStart:0
-                vertexCount:6];
-  }
-  [encoder endEncoding];
+  // Bottom-right: round-trip planes through MTLBuffer via copyFromTexture / copyFromBuffer.
+  id<MTLTexture> y_copy_tex =
+      CopyTextureThroughBuffer(device, commandBuffer, y_tex, y_desc);
+  id<MTLTexture> uv_copy_tex =
+      CopyTextureThroughBuffer(device, commandBuffer, uv_tex, uv_desc);
+  DrawYUVTexturesToLayer(commandBuffer, renderPipelineState, metal_copy_layer, y_copy_tex, uv_copy_tex);
 
-  [commandBuffer presentDrawable:drawable];
   [commandBuffer commit];
   [commandBuffer waitUntilCompleted];
 
+  [y_copy_tex release];
+  [uv_copy_tex release];
+  [y_tex release];
+  [uv_tex release];
+  [commandQueue release];
 }
 
 void DumpIOSurface(IOSurfaceRef io_surface) {
@@ -313,14 +419,18 @@ void InitializeLayer() {
   [sample_display_layer removeFromSuperlayer];
   [sample_display_layer release];
   sample_display_layer = [[AVSampleBufferDisplayLayer alloc] init];
-  [sample_display_layer setFrame:CGRectMake(0, 0, width/4, height/4)];
+  CGRect sample_display_frame = CGRectMake(0, 0, width/4, height/4);
+  [sample_display_layer setFrame:sample_display_frame];
   [background_layer addSublayer:sample_display_layer];
+  AddQuadrantLabel(@"AVSampleBufferDisplayLayer", sample_display_frame);
 
   [contents_layer removeFromSuperlayer];
   [contents_layer release];
   contents_layer = [[CALayer alloc] init];
-  [contents_layer setFrame:CGRectMake(0, height/4, width/4, height/4)];
+  CGRect contents_frame = CGRectMake(0, height/4, width/4, height/4);
+  [contents_layer setFrame:contents_frame];
   [background_layer addSublayer:contents_layer];
+  AddQuadrantLabel(@"CALayer setContents: (IOSurface)", contents_frame);
 }
 
 static void DecompressionSessionOutputCallback(
@@ -567,8 +677,6 @@ void DisplayNextDecodedFrame(CVPixelBufferRef cv_pixel_buffer) {
   status = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, cv_pixel_buffer, YES, NULL, NULL, video_info, &timing, &sample_buffer);
   CHECK(!status);
   CHECK(sample_buffer);
-
-  PrintCMSampleBufferAttachments(sample_buffer, "for display");
 
   // Set attachments on the CMSampleBuffer.
   CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample_buffer, YES);
