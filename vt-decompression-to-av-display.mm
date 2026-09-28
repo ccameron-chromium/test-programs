@@ -33,9 +33,9 @@ clang++ vt-decompression-to-av-display.mm \
 
 int decompression_pixel_format = 
     // kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange;
+    // kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange;
     // kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
-    // kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarVideoRange;
+    kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarVideoRange;
 
 
 
@@ -56,6 +56,7 @@ AVSampleBufferDisplayLayer* sample_display_layer = nil;
 CALayer* contents_layer = nil;
 CAMetalLayer* metal_layer = nil;
 CAMetalLayer* metal_copy_layer = nil;
+CAMetalLayer* metal_yuv_layer = nil;
 typedef std::map<CFAbsoluteTime, CVImageBufferRef> TimeToFrameMap;
 TimeToFrameMap decoded_images;
 std::deque<CVImageBufferRef> displayed_images;
@@ -167,6 +168,7 @@ void DrawYUVTexturesToLayer(id<MTLCommandBuffer> commandBuffer,
 void DrawWithMetal(IOSurfaceRef io_surface) {
   static id<MTLDevice> device = nil;
   static id<MTLRenderPipelineState> renderPipelineState = nil;
+  static id<MTLRenderPipelineState> renderPipelineStateRGB = nil;
 
   if (!device) {
     NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
@@ -212,6 +214,12 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
         "                                0.0,       0.0,       0.0,       1.0);\n"
         "    return transpose(yuv2rgb) * yuv1;\n"
         "}\n"
+        "\n"
+        "fragment float4 fragmentShaderRGB(RasterizerData in [[stage_in]],\n"
+        "                                  texture2d<float> rgb_tex [[texture(0)]]) {\n"
+        "    sampler s(mag_filter::linear, min_filter::linear);\n"
+        "    return float4(rgb_tex.sample(s, in.texCoord).rgb, 1.0);\n"
+        "}\n"
         "";
  
     id<MTLLibrary> library = nil;
@@ -228,6 +236,7 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
     }
     id<MTLFunction> vertexFunction = [library newFunctionWithName:@"vertexShader"];
     id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"fragmentShader"];
+    id<MTLFunction> fragmentFunctionRGB = [library newFunctionWithName:@"fragmentShaderRGB"];
     {
       NSError* error = nil;
       MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
@@ -245,7 +254,40 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
                                                                    error:&error];
       if (error)
         NSLog(@"Failed to create render pipeline state: %@", error);
+
+      desc.fragmentFunction = fragmentFunctionRGB;
+      renderPipelineStateRGB = [device newRenderPipelineStateWithDescriptor:desc
+                                                                      error:&error];
+      if (error)
+        NSLog(@"Failed to create RGB render pipeline state: %@", error);
     }
+  }
+
+  MTLPixelFormat y_format;
+  MTLPixelFormat uv_format;
+  MTLPixelFormat yuv_format;
+  switch (IOSurfaceGetPixelFormat(io_surface)) {
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange:
+      printf("** 8-bit format!\n");
+      y_format = MTLPixelFormatR8Unorm;
+      uv_format = MTLPixelFormatRG8Unorm;
+      yuv_format = (MTLPixelFormat)500;
+      break;
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+      printf("** 10-bit format!\n");
+      y_format = MTLPixelFormatR16Unorm;
+      uv_format = MTLPixelFormatRG16Unorm;
+      yuv_format = (MTLPixelFormat)505;
+      break;
+    case kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarVideoRange:
+      printf("** 10-bit format, compressed!\n");
+      y_format = MTLPixelFormatR16Unorm;
+      uv_format = MTLPixelFormatRG16Unorm;
+      yuv_format = (MTLPixelFormat)508;
+      break;
+    default:
+      CHECK(!"unrecognized format...\n");
   }
 
   if (!metal_layer) {
@@ -257,9 +299,13 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
     [background_layer addSublayer:metal_layer];
 
     printf("CAMetalLayer setContents: is in top-right\n");
-    CGRect metal_frame = CGRectMake(width/4, height/4, width/4, height/4);
+    CGRect metal_frame = CGRectMake(width/4, 2*(height/4), width/4, height/4);
     [metal_layer setFrame:metal_frame];
-    AddQuadrantLabel(@"CAMetalLayer (YUV->RGB shader)", metal_frame);
+    AddQuadrantLabel(
+        [NSString stringWithFormat:@"CAMetalLayer (YUV->RGB shader, %lu/%lu)",
+                                   (unsigned long)y_format,
+                                   (unsigned long)uv_format],
+        metal_frame);
   }
 
   if (!metal_copy_layer) {
@@ -270,29 +316,27 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
 
     [background_layer addSublayer:metal_copy_layer];
 
-    printf("CAMetalLayer (copyFromTexture) is in bottom-right\n");
-    CGRect metal_copy_frame = CGRectMake(width/4, 0, width/4, height/4);
+    printf("CAMetalLayer (copyFromTexture) is in middle-right\n");
+    CGRect metal_copy_frame = CGRectMake(width/4, height/4, width/4, height/4);
     [metal_copy_layer setFrame:metal_copy_frame];
     AddQuadrantLabel(@"CAMetalLayer (copyFromTexture->Buffer)", metal_copy_frame);
   }
 
-  MTLPixelFormat y_format;
-  MTLPixelFormat uv_format;
-  switch (IOSurfaceGetPixelFormat(io_surface)) {
-    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
-    case kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange:
-      printf("** 8-bit format!\n");
-      y_format = MTLPixelFormatR8Unorm;
-      uv_format = MTLPixelFormatRG8Unorm;
-      break;
-    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
-    case kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarVideoRange:
-      printf("** 10-bit format!\n");
-      y_format = MTLPixelFormatR16Unorm;
-      uv_format = MTLPixelFormatRG16Unorm;
-      break;
-    default:
-      CHECK(!"unrecognized format...\n");
+  if (!metal_yuv_layer) {
+    metal_yuv_layer = [[CAMetalLayer alloc] init];
+    metal_yuv_layer.device = device;
+    metal_yuv_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metal_yuv_layer.colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+
+    [background_layer addSublayer:metal_yuv_layer];
+
+    printf("CAMetalLayer (YUV format) is in bottom-right\n");
+    CGRect metal_yuv_frame = CGRectMake(width/4, 0, width/4, height/4);
+    [metal_yuv_layer setFrame:metal_yuv_frame];
+    AddQuadrantLabel(
+        [NSString stringWithFormat:@"CAMetalLayer (YUV format %lu)",
+                                   (unsigned long)yuv_format],
+        metal_yuv_frame);
   }
 
   // Bind planes to textures
@@ -317,22 +361,40 @@ void DrawWithMetal(IOSurfaceRef io_surface) {
     exit(1);
   }
 
+  MTLTextureDescriptor *yuv_desc = [MTLTextureDescriptor
+      texture2DDescriptorWithPixelFormat:yuv_format
+                                   width:width
+                                  height:height
+                               mipmapped:NO];
+  yuv_desc.usage = MTLTextureUsageShaderRead;
+  id<MTLTexture> yuv_tex =
+      [device newTextureWithDescriptor:yuv_desc iosurface:io_surface plane:0];
+  if (!yuv_tex) {
+    NSLog(@"Failed to create Metal texture with yuv_format from IOSurface plane 0");
+  }
+
   id<MTLCommandQueue> commandQueue = [device newCommandQueue];
   id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
 
   // Top-right: sample directly from IOSurface-backed textures.
   DrawYUVTexturesToLayer(commandBuffer, renderPipelineState, metal_layer, y_tex, uv_tex);
 
-  // Bottom-right: round-trip planes through MTLBuffer via copyFromTexture / copyFromBuffer.
+  // Middle-right: round-trip planes through MTLBuffer via copyFromTexture / copyFromBuffer.
   id<MTLTexture> y_copy_tex =
       CopyTextureThroughBuffer(device, commandBuffer, y_tex, y_desc);
   id<MTLTexture> uv_copy_tex =
       CopyTextureThroughBuffer(device, commandBuffer, uv_tex, uv_desc);
   DrawYUVTexturesToLayer(commandBuffer, renderPipelineState, metal_copy_layer, y_copy_tex, uv_copy_tex);
 
+  // Bottom-right: sample plane 0 with yuv_format directly as RGB.
+  if (yuv_tex) {
+    DrawYUVTexturesToLayer(commandBuffer, renderPipelineStateRGB, metal_yuv_layer, yuv_tex, nil);
+  }
+
   [commandBuffer commit];
   [commandBuffer waitUntilCompleted];
 
+  [yuv_tex release];
   [y_copy_tex release];
   [uv_copy_tex release];
   [y_tex release];
@@ -413,13 +475,13 @@ void ReadFileFromDisk(const char* filename) {
 
 // Initialize the CALayer, which will have its contents set to each frame.
 void InitializeLayer() {
-  printf("AVSampleBufferDisplayLayer is in bottom-left\n");
+  printf("AVSampleBufferDisplayLayer is in middle-left\n");
   printf("CALayer setContents: is in top-left\n");
 
   [sample_display_layer removeFromSuperlayer];
   [sample_display_layer release];
   sample_display_layer = [[AVSampleBufferDisplayLayer alloc] init];
-  CGRect sample_display_frame = CGRectMake(0, 0, width/4, height/4);
+  CGRect sample_display_frame = CGRectMake(0, height/4, width/4, height/4);
   [sample_display_layer setFrame:sample_display_frame];
   [background_layer addSublayer:sample_display_layer];
   AddQuadrantLabel(@"AVSampleBufferDisplayLayer", sample_display_frame);
@@ -427,7 +489,7 @@ void InitializeLayer() {
   [contents_layer removeFromSuperlayer];
   [contents_layer release];
   contents_layer = [[CALayer alloc] init];
-  CGRect contents_frame = CGRectMake(0, height/4, width/4, height/4);
+  CGRect contents_frame = CGRectMake(0, 2*(height/4), width/4, height/4);
   [contents_layer setFrame:contents_frame];
   [background_layer addSublayer:contents_layer];
   AddQuadrantLabel(@"CALayer setContents: (IOSurface)", contents_frame);
@@ -759,7 +821,7 @@ int main(int argc, char* argv[]) {
   height = CVPixelBufferGetHeight(pixel_buffer);
 
   window = [[MainWindow alloc]
-    initWithContentRect:NSMakeRect(100, 100, width/2, height/2)
+    initWithContentRect:NSMakeRect(100, 100, width/2, 3*(height/4))
     styleMask:NSWindowStyleMaskTitled
     backing:NSBackingStoreBuffered
     defer:NO];
